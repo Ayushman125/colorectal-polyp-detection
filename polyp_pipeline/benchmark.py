@@ -9,7 +9,16 @@ from typing import Any
 from .classical import run_classical_cv
 from .data import Case
 from .deep import train_cross_validation
-from .models import MODEL_SPECS
+BASELINE_MODEL_NAMES = (
+    "unet_resnet34",
+    "unet_resnet50",
+    "unet_efficientnet_b0",
+    "unetpp_resnet34",
+    "unetpp_resnet50",
+    "unetpp_efficientnet_b0",
+    "fpn_resnet34",
+    "deeplabv3plus_resnet34",
+)
 
 
 def _atomic_json(path: Path, payload: object) -> None:
@@ -42,7 +51,7 @@ def full_benchmark_plan() -> list[dict[str, str]]:
             "preprocessing": "clahe",
             "kind": "deep",
         }
-        for model_name in MODEL_SPECS
+        for model_name in BASELINE_MODEL_NAMES
     ]
     plan.extend(
         [

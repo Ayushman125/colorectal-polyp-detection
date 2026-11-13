@@ -213,6 +213,7 @@ def _predict_outer_test(
     size: int,
     write_overlays: bool,
     sessile_case_ids: set[str],
+    test_time_augmentation: bool = False,
 ) -> tuple[dict[str, float], list[dict[str, object]]]:
     model.eval()
     sum_counts = np.zeros(4, dtype=np.int64)
@@ -224,7 +225,9 @@ def _predict_outer_test(
     detection_targets: list[tuple[str, tuple[int, int, int, int]]] = []
     inference_seconds = 0.0
     case_by_id = _case_map(cases)
-    prediction_dir = output_dir / "predictions"
+    prediction_dir = output_dir / (
+        "predictions_tta" if test_time_augmentation else "predictions"
+    )
     prediction_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.inference_mode():
@@ -233,8 +236,18 @@ def _predict_outer_test(
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             start = time.perf_counter()
-            logits = model(images)
-            probabilities = torch.sigmoid(logits).cpu().numpy()[:, 0]
+            if test_time_augmentation:
+                probability_views = [torch.sigmoid(model(images))]
+                for dimensions in ((3,), (2,), (2, 3)):
+                    transformed = torch.flip(images, dims=dimensions)
+                    transformed_probabilities = torch.sigmoid(model(transformed))
+                    probability_views.append(
+                        torch.flip(transformed_probabilities, dims=dimensions)
+                    )
+                probabilities = torch.stack(probability_views).mean(dim=0)
+            else:
+                probabilities = torch.sigmoid(model(images))
+            probabilities = probabilities.cpu().numpy()[:, 0]
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             inference_seconds += time.perf_counter() - start
@@ -279,7 +292,7 @@ def _predict_outer_test(
                     str(prediction_dir / f"{case_id}.png"),
                     (probability * 255).clip(0, 255).astype(np.uint8),
                 )
-                if write_overlays:
+                if write_overlays and not test_time_augmentation:
                     original = cv2.imread(str(case.image_path), cv2.IMREAD_COLOR)
                     original = cv2.resize(original, (size, size))
                     target_overlay = original.copy()
@@ -349,6 +362,7 @@ def train_cross_validation(
     overlays: bool = True,
     progress_log_path: Path | None = None,
     sessile_case_ids: set[str] | None = None,
+    test_time_augmentation: bool = False,
 ) -> list[dict[str, float | int | str]]:
     if model_name not in MODEL_SPECS:
         raise ValueError(f"Unsupported model: {model_name}")
@@ -386,6 +400,8 @@ def train_cross_validation(
         "torch_cuda_version": torch.version.cuda,
         "opencv_version": cv2.__version__,
     }
+    if test_time_augmentation:
+        run_config["test_time_augmentation"] = True
     try:
         import segmentation_models_pytorch as smp
 
@@ -683,6 +699,22 @@ def train_cross_validation(
             overlays,
             sessile_case_ids,
         )
+        tta_per_image_rows: list[dict[str, object]] = []
+        if test_time_augmentation:
+            tta_metrics, tta_per_image_rows = _predict_outer_test(
+                model,
+                test_cases,
+                test_loader,
+                device,
+                fold_dir,
+                threshold,
+                image_size,
+                False,
+                sessile_case_ids,
+                test_time_augmentation=True,
+            )
+        else:
+            tta_metrics = {}
         _write_csv_atomic(
             fold_dir / "per_image_metrics.csv", fold_per_image_rows
         )
@@ -691,6 +723,18 @@ def train_cross_validation(
             for row in per_image_rows
             if int(row.get("fold", -1)) != fold_number
         ] + fold_per_image_rows
+        if test_time_augmentation:
+            tta_per_image_path = output_dir / "per_image_metrics_tta.csv"
+            all_tta_rows: list[dict[str, object]] = []
+            if tta_per_image_path.is_file():
+                with tta_per_image_path.open(newline="", encoding="utf-8") as file:
+                    all_tta_rows = list(csv.DictReader(file))
+            all_tta_rows = [
+                row
+                for row in all_tta_rows
+                if int(row.get("fold", -1)) != fold_number
+            ] + tta_per_image_rows
+            _write_csv_atomic(tta_per_image_path, all_tta_rows)
         result: dict[str, float | int | str] = {
             "model": model_name,
             "loss": loss_name,
@@ -704,6 +748,9 @@ def train_cross_validation(
             "profiled_image_size": image_size,
             **test_metrics,
         }
+        result.update(
+            {f"tta_{metric}": value for metric, value in tta_metrics.items()}
+        )
         results.append(result)
         results.sort(key=lambda row: int(row["fold"]))
         _write_csv_atomic(metrics_path, results)
@@ -735,6 +782,20 @@ def train_cross_validation(
         "gflops_per_image",
         "profiled_image_size",
     )
+    if test_time_augmentation:
+        metric_names += tuple(
+            f"tta_{metric}"
+            for metric in (
+                "dice",
+                "miou",
+                "sensitivity",
+                "specificity",
+                "ap50",
+                "box_precision",
+                "box_recall",
+                "inference_fps",
+            )
+        )
     if len(completed_folds) == n_splits:
         _atomic_json_write(
             output_dir / "summary.json",

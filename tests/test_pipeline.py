@@ -93,6 +93,44 @@ class FeatureAndMetricTests(unittest.TestCase):
         self.assertEqual(result["sensitivity"], 0.0)
         self.assertEqual(result["specificity"], 0.0)
 
+    def test_advanced_losses_produce_finite_gradients(self) -> None:
+        import torch
+
+        from polyp_pipeline.models import segmentation_loss
+
+        targets = torch.zeros(2, 1, 32, 32)
+        targets[:, :, 8:24, 8:24] = 1.0
+        for loss_name in ("focal_tversky", "dice_boundary"):
+            logits = torch.zeros_like(targets, requires_grad=True)
+            loss = segmentation_loss(loss_name, logits, targets)
+            self.assertTrue(torch.isfinite(loss).item())
+            loss.backward()
+            self.assertIsNotNone(logits.grad)
+            self.assertTrue(torch.isfinite(logits.grad).all().item())
+
+    def test_transformer_models_return_full_resolution_logits(self) -> None:
+        import torch
+
+        from polyp_pipeline.models import build_model
+
+        for name in ("segformer_mit_b0", "upernet_mit_b0"):
+            model = build_model(name, pretrained_encoder=False).eval()
+            with torch.inference_mode():
+                logits = model(torch.zeros(1, 3, 128, 128))
+            self.assertEqual(tuple(logits.shape), (1, 1, 128, 128))
+
+    def test_advanced_plan_is_pretrained_and_includes_transformers_and_tta(self) -> None:
+        from polyp_pipeline.advanced_benchmark import advanced_benchmark_plan
+
+        plan = advanced_benchmark_plan()
+        self.assertEqual(len(plan), 6)
+        self.assertTrue(all(item["pretrained_encoder"] for item in plan))
+        self.assertTrue(all(item["test_time_augmentation"] for item in plan))
+        self.assertIn("segformer_mit_b0", {item["model"] for item in plan})
+        self.assertIn("upernet_mit_b0", {item["model"] for item in plan})
+        self.assertIn("focal_tversky", {item["loss"] for item in plan})
+        self.assertIn("dice_boundary", {item["loss"] for item in plan})
+
     def test_report_combines_classical_fold_results(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -125,8 +163,12 @@ class FeatureAndMetricTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (run / "fold_metrics.csv").write_text(
-                "model,loss,preprocessing,fold,dice\n"
-                "unet_resnet34,bce_dice,clahe,1,0.5\n",
+                "model,loss,preprocessing,fold,dice,miou,sensitivity,specificity,"
+                "ap50,box_precision,box_recall,inference_fps,tta_dice,tta_miou,"
+                "tta_sensitivity,tta_specificity,tta_ap50,tta_box_precision,"
+                "tta_box_recall,tta_inference_fps\n"
+                "unet_resnet34,bce_dice,clahe,1,0.5,0.4,0.6,0.9,0.3,0.4,0.5,10,"
+                "0.6,0.5,0.7,0.92,0.4,0.5,0.6,3\n",
                 encoding="utf-8",
             )
             (run / "per_image_metrics.csv").write_text(
@@ -136,12 +178,22 @@ class FeatureAndMetricTests(unittest.TestCase):
                 "case_b,1,0.7,0.6,0.8,0.95,1,0.1,False\n",
                 encoding="utf-8",
             )
+            (run / "per_image_metrics_tta.csv").write_text(
+                "case_id,fold,dice,miou,sensitivity,specificity,"
+                "target_box_count,target_box_area_fraction,is_sessile_subset\n"
+                "case_a,1,0.6,0.5,0.7,0.92,1,0.01,True\n",
+                encoding="utf-8",
+            )
             generate_report(root / "runs", root / "reports")
             subgroup_csv = (root / "reports" / "subgroup_comparison.csv").read_text(
                 encoding="utf-8"
             )
             self.assertIn("sessile_subset", subgroup_csv)
             self.assertIn("small_bbox_area_le_2pct", subgroup_csv)
+            comparison_csv = (root / "reports" / "benchmark_comparison.csv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("unet_resnet34_tta,clahe,bce_dice,1", comparison_csv)
 
     def test_training_resumes_from_last_completed_epoch(self) -> None:
         import torch
@@ -210,6 +262,7 @@ class FeatureAndMetricTests(unittest.TestCase):
                         validation_fraction=0.5,
                         device_name="cpu",
                         overlays=False,
+                        test_time_augmentation=True,
                     )
 
             self.assertTrue(
@@ -232,11 +285,14 @@ class FeatureAndMetricTests(unittest.TestCase):
                     validation_fraction=0.5,
                     device_name="cpu",
                     overlays=False,
+                    test_time_augmentation=True,
                 )
             self.assertEqual(len(results), 2)
+            self.assertIn("tta_dice", results[0])
             progress = (output_dir / "progress.jsonl").read_text(encoding="utf-8")
             self.assertIn('"event": "fold_resumed"', progress)
             self.assertTrue((output_dir / "summary.json").is_file())
+            self.assertTrue((output_dir / "per_image_metrics_tta.csv").is_file())
 
 
 if __name__ == "__main__":

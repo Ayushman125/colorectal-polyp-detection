@@ -21,6 +21,14 @@ METRICS = (
     "gflops_per_image",
     "profiled_image_size",
     "patch_accuracy",
+    "tta_dice",
+    "tta_miou",
+    "tta_sensitivity",
+    "tta_specificity",
+    "tta_ap50",
+    "tta_box_precision",
+    "tta_box_recall",
+    "tta_inference_fps",
 )
 
 
@@ -28,7 +36,28 @@ def _read_result_rows(root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in root.rglob("fold_metrics.csv"):
         with path.open(newline="", encoding="utf-8") as file:
-            rows.extend(dict(row) for row in csv.DictReader(file))
+            for source_row in csv.DictReader(file):
+                row = dict(source_row)
+                rows.append(row)
+                if row.get("tta_dice") not in (None, ""):
+                    tta_row = {
+                        key: value
+                        for key, value in row.items()
+                        if not key.startswith("tta_")
+                    }
+                    tta_row["model"] = f"{row['model']}_tta"
+                    for metric in (
+                        "dice",
+                        "miou",
+                        "sensitivity",
+                        "specificity",
+                        "ap50",
+                        "box_precision",
+                        "box_recall",
+                        "inference_fps",
+                    ):
+                        tta_row[metric] = row.get(f"tta_{metric}", "")
+                    rows.append(tta_row)
     for path in root.rglob("classical_metrics.json"):
         rows.extend(json.loads(path.read_text(encoding="utf-8")))
     if not rows:
@@ -80,7 +109,10 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
         writer.writerows(report_rows)
 
     subgroup_rows: list[dict[str, Any]] = []
-    for path in input_dir.rglob("per_image_metrics.csv"):
+    per_image_paths = list(input_dir.rglob("per_image_metrics.csv"))
+    per_image_paths.extend(input_dir.rglob("per_image_metrics_tta.csv"))
+    for path in per_image_paths:
+        is_tta = path.name == "per_image_metrics_tta.csv"
         config_path = path.parent / "run_config.json"
         if not config_path.is_file():
             continue
@@ -93,7 +125,11 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
         for row in image_rows:
             grouped_images[
                 (
-                    row.get("model", config.get("model", "unknown")),
+                    (
+                        f"{row.get('model', config.get('model', 'unknown'))}_tta"
+                        if is_tta
+                        else row.get("model", config.get("model", "unknown"))
+                    ),
                     row.get("loss", config.get("loss", "not_applicable")),
                     row.get("preprocessing", config.get("preprocessing", "unknown")),
                 )

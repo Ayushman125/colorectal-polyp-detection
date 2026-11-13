@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .advanced_benchmark import run_advanced_benchmark
 from .benchmark import read_benchmark_status, run_full_benchmark
 from .classical import run_classical_cv
 from .data import discover_cases
@@ -38,7 +39,13 @@ def build_parser() -> argparse.ArgumentParser:
     deep.add_argument("--model", choices=tuple(MODEL_SPECS), default="unet_resnet34")
     deep.add_argument(
         "--loss",
-        choices=("bce", "bce_dice", "weighted_bce_iou"),
+        choices=(
+            "bce",
+            "bce_dice",
+            "weighted_bce_iou",
+            "focal_tversky",
+            "dice_boundary",
+        ),
         default="bce_dice",
     )
     deep.add_argument("--batch-size", type=int, default=4)
@@ -50,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     deep.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     deep.add_argument("--num-workers", type=int, default=0)
     deep.add_argument("--pretrained-encoder", action="store_true")
+    deep.add_argument("--test-time-augmentation", action="store_true")
     deep.add_argument("--no-overlays", action="store_true")
 
     classical = commands.add_parser(
@@ -82,6 +90,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark.add_argument("--no-overlays", action="store_true")
 
+    advanced = commands.add_parser(
+        "advanced-benchmark",
+        help="Run/resume pretrained CNN and transformer experiments with TTA.",
+    )
+    advanced.add_argument("--dataset-root", type=Path, default=Path("kvasir-seg") / "Kvasir-SEG")
+    advanced.add_argument("--output-dir", type=Path, default=Path("runs") / "advanced_benchmark")
+    advanced.add_argument("--folds", type=int, default=5)
+    advanced.add_argument("--seed", type=int, default=42)
+    advanced.add_argument("--size", type=int, default=352)
+    advanced.add_argument("--batch-size", type=int, default=4)
+    advanced.add_argument("--epochs", type=int, default=30)
+    advanced.add_argument("--patience", type=int, default=6)
+    advanced.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    advanced.add_argument("--num-workers", type=int, default=0)
+    advanced.add_argument(
+        "--sessile-image-dir",
+        type=Path,
+        default=Path("kvasir-sessile") / "sessile-main-Kvasir-SEG" / "images",
+    )
+    advanced.add_argument("--no-overlays", action="store_true")
+
     status = commands.add_parser(
         "status", help="Show completed, running, and pending benchmark experiments."
     )
@@ -102,6 +131,8 @@ def main() -> None:
     if args.command == "train":
         output_dir = args.output_dir / (
             f"{args.model}_{args.loss}_{args.preprocessing}"
+            f"{'_imagenet' if args.pretrained_encoder else ''}"
+            f"{'_tta' if args.test_time_augmentation else ''}"
         )
         train_cross_validation(
             cases,
@@ -122,6 +153,7 @@ def main() -> None:
             pretrained_encoder=args.pretrained_encoder,
             num_workers=args.num_workers,
             overlays=not args.no_overlays,
+            test_time_augmentation=args.test_time_augmentation,
         )
     elif args.command == "classical":
         output_dir = args.output_dir / f"classical_{args.preprocessing}"
@@ -134,6 +166,27 @@ def main() -> None:
             grid_size=args.grid_size,
             preprocessing=args.preprocessing,
         )
+    elif args.command == "advanced-benchmark":
+        sessile_case_ids = (
+            {path.stem for path in args.sessile_image_dir.glob("*") if path.is_file()}
+            if args.sessile_image_dir.is_dir()
+            else set()
+        )
+        state = run_advanced_benchmark(
+            cases,
+            args.output_dir,
+            n_splits=args.folds,
+            seed=args.seed,
+            image_size=args.size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            patience=args.patience,
+            device_name=args.device,
+            num_workers=args.num_workers,
+            sessile_case_ids=sessile_case_ids,
+            overlays=not args.no_overlays,
+        )
+        print(json.dumps(state, indent=2))
     else:
         sessile_case_ids = (
             {path.stem for path in args.sessile_image_dir.glob("*") if path.is_file()}

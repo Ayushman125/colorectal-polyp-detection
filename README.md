@@ -164,6 +164,65 @@ Available model names and losses are registered in
 the SMP encoder from ImageNet weights; this can require a network download and
 does not reproduce the benchmark's random initialization.
 
+## Advanced pretrained and transformer benchmark
+
+The advanced runner builds on the completed scratch-initialized benchmark
+without overwriting its results. It trains six new configurations, all on the
+same image-level folds and CLAHE preprocessing:
+
+1. ImageNet-pretrained FPN/ResNet-34 with BCE+Dice.
+2. ImageNet-pretrained DeepLabV3+/ResNet-34 with BCE+Dice.
+3. ImageNet-pretrained SegFormer/MiT-B0 with BCE+Dice.
+4. ImageNet-pretrained UPerNet/MiT-B0 with BCE+Dice.
+5. ImageNet-pretrained FPN/ResNet-34 with focal Tversky loss.
+6. ImageNet-pretrained FPN/ResNet-34 with Dice plus signed-distance boundary
+   loss.
+
+Each selected checkpoint is evaluated both with ordinary inference and
+four-view test-time augmentation (original, horizontal flip, vertical flip,
+and both flips). Flipped predictions are unflipped back to the original
+orientation and averaged as probabilities before the fixed 0.5 threshold.
+Training runs once per configuration; the ordinary-vs-TTA comparison uses the
+same checkpoint and held-out outer-fold images. This isolates TTA's
+post-processing effect from training variability.
+
+Run the advanced matrix with the same dataset and device settings:
+
+```powershell
+python -m polyp_pipeline advanced-benchmark `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "runs\advanced_benchmark" `
+  --folds 5 --seed 42 --size 352 `
+  --batch-size 4 --epochs 30 --patience 6 `
+  --device cuda
+```
+
+Monitor or resume with the exact same command:
+
+```powershell
+python -m polyp_pipeline status --input-dir "runs\advanced_benchmark"
+```
+
+Pretrained weights are downloaded through the registered SMP encoder weights
+and cached by the model library. The advanced runner saves its plan, status,
+progress events, per-fold best and latest checkpoints, and model outputs under
+`runs/advanced_benchmark/`. Per-fold `fold_metrics.csv` includes the ordinary
+metrics and `tta_*` metrics. TTA per-image rows are stored separately in
+`per_image_metrics_tta.csv`; probability outputs use `predictions_tta/`.
+
+To produce an advanced-only report:
+
+```powershell
+python -m polyp_pipeline report `
+  --input-dir "runs\advanced_benchmark" `
+  --output-dir "reports\advanced_benchmark"
+```
+
+The report emits model names with a `_tta` suffix for the TTA version, making
+the paired comparison visible alongside regular inference. This project uses
+TTA as the selected inference-refinement experiment; it does not claim to
+implement or evaluate a Dense CRF.
+
 ## Pipeline details
 
 ### Preprocessing and augmentation
@@ -249,6 +308,17 @@ are:
   normalized by `sum(w)` and
   `1 - (sum(w p y) + 1) / (sum(w (p + y)) - sum(w p y) + 1)`.
   This emphasizes mask-boundary pixels.
+- **Focal Tversky loss:** for each image, let `TP=sum(p y)`,
+  `FP=sum(p (1-y))`, and `FN=sum((1-p)y)`. Then
+  `T = (TP + 1) / (TP + 0.3 FP + 0.7 FN + 1)` and
+  `L = (1-T)^0.75`, averaged over images. The larger false-negative weight
+  emphasizes recall; it does not guarantee a clinical sensitivity gain.
+- **Dice + signed-distance boundary loss:** let `d` be the signed Euclidean
+  distance transform of the binary mask (negative inside the foreground,
+  positive outside), normalized by the larger image dimension. The loss is
+  `1 - Dice_soft + 0.1 mean(p d)`. The distance map is computed from training
+  labels only; it is not learned from or estimated using held-out test images.
+  The coefficient is fixed rather than selected using test performance.
 
 ### Cross-validation and leakage controls
 

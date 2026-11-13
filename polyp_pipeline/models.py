@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -21,6 +22,8 @@ MODEL_SPECS = {
     "unetpp_efficientnet_b0": ModelSpec("UnetPlusPlus", "efficientnet-b0"),
     "fpn_resnet34": ModelSpec("FPN", "resnet34"),
     "deeplabv3plus_resnet34": ModelSpec("DeepLabV3Plus", "resnet34"),
+    "segformer_mit_b0": ModelSpec("Segformer", "mit_b0"),
+    "upernet_mit_b0": ModelSpec("UPerNet", "mit_b0"),
 }
 
 
@@ -73,6 +76,58 @@ def weighted_bce_iou_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.T
     return (weighted_bce + weighted_iou).mean()
 
 
+def focal_tversky_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.3,
+    beta: float = 0.7,
+    gamma: float = 0.75,
+    smooth: float = 1.0,
+) -> torch.Tensor:
+    if alpha < 0 or beta < 0 or gamma <= 0 or smooth <= 0:
+        raise ValueError("Tversky weights must be non-negative and gamma/smooth positive")
+    probabilities = torch.sigmoid(logits)
+    dimensions = (1, 2, 3)
+    true_positive = (probabilities * target).sum(dim=dimensions)
+    false_positive = (probabilities * (1.0 - target)).sum(dim=dimensions)
+    false_negative = ((1.0 - probabilities) * target).sum(dim=dimensions)
+    tversky = (true_positive + smooth) / (
+        true_positive + alpha * false_positive + beta * false_negative + smooth
+    )
+    return (1.0 - tversky).clamp_min(0.0).pow(gamma).mean()
+
+
+def dice_boundary_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    boundary_weight: float = 0.1,
+) -> torch.Tensor:
+    if boundary_weight < 0:
+        raise ValueError("boundary_weight must be non-negative")
+    from scipy.ndimage import distance_transform_edt
+
+    probabilities = torch.sigmoid(logits)
+    dimensions = (1, 2, 3)
+    intersection = (probabilities * target).sum(dim=dimensions)
+    denominator = probabilities.sum(dim=dimensions) + target.sum(dim=dimensions)
+    dice = (2.0 * intersection + 1.0) / (denominator + 1.0)
+    binary_targets = target.detach().to(device="cpu").numpy()[:, 0] > 0.5
+    signed_distances = []
+    normalizer = max(target.shape[-2:])
+    for binary_target in binary_targets:
+        distance_inside = distance_transform_edt(binary_target)
+        distance_outside = distance_transform_edt(~binary_target)
+        signed = (distance_outside - distance_inside) / normalizer
+        signed_distances.append(signed.astype("float32"))
+    distance_map = torch.as_tensor(
+        np.stack(signed_distances),
+        dtype=probabilities.dtype,
+        device=probabilities.device,
+    )[:, None]
+    boundary = (probabilities * distance_map).mean(dim=dimensions)
+    return (1.0 - dice + boundary_weight * boundary).mean()
+
+
 def segmentation_loss(name: str, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     if name == "bce":
         return nn.functional.binary_cross_entropy_with_logits(logits, target)
@@ -80,4 +135,8 @@ def segmentation_loss(name: str, logits: torch.Tensor, target: torch.Tensor) -> 
         return compound_bce_dice_loss(logits, target)
     if name == "weighted_bce_iou":
         return weighted_bce_iou_loss(logits, target)
+    if name == "focal_tversky":
+        return focal_tversky_loss(logits, target)
+    if name == "dice_boundary":
+        return dice_boundary_loss(logits, target)
     raise ValueError(f"Unsupported loss: {name}")
