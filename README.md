@@ -287,6 +287,8 @@ one foreground logit, and no output activation inside the model:
 | U-Net++ | `UnetPlusPlus` | ResNet-34, ResNet-50, EfficientNet-B0 |
 | FPN | `FPN` | ResNet-34 |
 | DeepLabV3+ | `DeepLabV3Plus` | ResNet-34 |
+| SegFormer | `Segformer` | MiT-B0 |
+| UPerNet | `UPerNet` | MiT-B0 |
 
 The sigmoid converts logits to foreground scores for validation/evaluation.
 Training uses AdamW with learning rate 1e-4 and weight decay 1e-4,
@@ -499,11 +501,14 @@ plots are kept under `reports/full_benchmark/`.
 
 ## Scope and limitations
 
-- HarDNet-MSEG, Polyp-PVT, and MedSAM 2 were not included. Their official
-  implementations, weights, and training procedures are distinct; a generic
-  SMP model is not a valid substitute.
-- Encoders in the completed benchmark were randomly initialized. Results do
-  not represent ImageNet-pretrained encoder performance.
+- The completed 13-experiment benchmark used randomly initialized encoders.
+  The separate advanced benchmark uses ImageNet-pretrained encoders and adds
+  SegFormer/MiT-B0 and UPerNet/MiT-B0 transformer models with four-view TTA.
+  The advanced run is resumable and its results are not final until all five
+  outer folds of each configuration complete.
+- HarDNet-MSEG, Polyp-PVT, and MedSAM 2 were not included. SegFormer and
+  UPerNet are general transformer segmentation architectures, not substitutes
+  for those polyp-specific or foundation-model implementations.
 - There is no independent external dataset, normal-patient control set, or
   clinical validation.
 - The sessile and small-box subgroup comparisons are descriptive; subgroup
