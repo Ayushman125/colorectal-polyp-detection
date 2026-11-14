@@ -221,7 +221,67 @@ python -m polyp_pipeline report `
 The report emits model names with a `_tta` suffix for the TTA version, making
 the paired comparison visible alongside regular inference. This project uses
 TTA as the selected inference-refinement experiment; it does not claim to
-implement or evaluate a Dense CRF.
+implement or evaluate a Dense CRF. The completed run and its results are
+summarized below; the complete comparison and subgroup tables are also saved
+in [reports/advanced_benchmark](reports/advanced_benchmark/).
+
+### Completed pretrained and transformer results
+
+The advanced benchmark completed all six configurations with five outer folds
+each on the 1,000-image dataset. Values are mean +/- sample standard deviation
+across the five held-out folds. Ordinary and TTA evaluations use the same
+fold-specific best checkpoint; TTA averages four transformed views before
+thresholding. FPS is model-only inference throughput on the RTX 3050 Ti, not
+end-to-end application latency.
+
+| Model | Loss | Dice | TTA Dice | mIoU | Sensitivity | Pixel specificity | AP50 | Box precision | Box recall | FPS | TTA FPS |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| FPN / ResNet-34 (ImageNet) | BCE+Dice | 0.885 +/- 0.013 | **0.895 +/- 0.016** | 0.818 +/- 0.017 | 0.881 +/- 0.028 | 0.983 +/- 0.003 | 0.870 +/- 0.027 | 0.700 +/- 0.042 | 0.887 +/- 0.023 | 51.8 +/- 2.3 | 35.0 +/- 0.7 |
+| DeepLabV3+ / ResNet-34 (ImageNet) | BCE+Dice | **0.886 +/- 0.008** | 0.894 +/- 0.007 | **0.821 +/- 0.009** | 0.888 +/- 0.018 | 0.982 +/- 0.001 | **0.882 +/- 0.023** | 0.732 +/- 0.057 | **0.894 +/- 0.025** | 50.2 +/- 2.0 | 32.0 +/- 0.2 |
+| SegFormer / MiT-B0 (ImageNet) | BCE+Dice | 0.881 +/- 0.011 | 0.888 +/- 0.008 | 0.811 +/- 0.013 | 0.881 +/- 0.025 | 0.981 +/- 0.004 | 0.878 +/- 0.015 | 0.673 +/- 0.084 | 0.891 +/- 0.010 | **59.6 +/- 4.7** | 34.0 +/- 0.4 |
+| UPerNet / MiT-B0 (ImageNet) | BCE+Dice | 0.881 +/- 0.014 | 0.887 +/- 0.013 | 0.812 +/- 0.017 | 0.878 +/- 0.019 | 0.982 +/- 0.004 | 0.866 +/- 0.027 | 0.739 +/- 0.022 | 0.879 +/- 0.027 | 45.8 +/- 0.4 | 18.9 +/- 0.1 |
+| FPN / ResNet-34 (ImageNet) | Focal Tversky | 0.872 +/- 0.008 | 0.881 +/- 0.004 | 0.799 +/- 0.013 | **0.886 +/- 0.033** | 0.973 +/- 0.006 | 0.866 +/- 0.014 | 0.747 +/- 0.067 | 0.882 +/- 0.012 | 53.6 +/- 3.4 | 34.9 +/- 0.2 |
+| FPN / ResNet-34 (ImageNet) | Dice + boundary | 0.879 +/- 0.008 | 0.889 +/- 0.008 | 0.809 +/- 0.010 | 0.883 +/- 0.029 | 0.976 +/- 0.010 | 0.869 +/- 0.026 | **0.762 +/- 0.068** | 0.885 +/- 0.031 | 54.9 +/- 2.8 | 35.1 +/- 0.2 |
+
+TTA improved mean Dice in all six configurations. Across configurations, the
+paired mean Dice improvement was approximately 0.008, while mean throughput
+dropped by approximately 21 FPS. For the BCE+Dice FPN reference, TTA increased
+Dice from 0.885 to 0.895 and sensitivity from 0.881 to 0.889, while throughput
+decreased from 51.8 to 35.0 FPS. Thus TTA is an accuracy/latency tradeoff, not
+a free improvement.
+
+The pretrained FPN BCE+Dice mean Dice (0.885) is 0.045 higher than the
+scratch-initialized FPN BCE+Dice result in the original benchmark (0.840).
+This is a descriptive comparison using the same dataset and fold protocol,
+not a significance test or an isolated causal estimate of pretraining.
+DeepLabV3+ reached the highest ordinary-inference Dice (0.886) and AP50
+(0.882). SegFormer delivered the highest measured ordinary FPS (59.6) with
+Dice 0.881, making it a favorable speed/accuracy point in this particular
+hardware and evaluation setup. Transformer performance was competitive with
+the pretrained CNN models, but did not exceed the best mean Dice.
+
+For the FPN loss ablation, focal Tversky produced the highest mean sensitivity
+(0.886 versus 0.881 for BCE+Dice) but lower mean Dice (0.872 versus 0.885)
+and lower pixel specificity. Dice plus boundary loss also did not improve
+mean Dice (0.879). The loss changes therefore did not establish a general
+improvement; their tradeoffs should be judged across metrics rather than
+sensitivity alone.
+
+Subgroup analysis remains descriptive. With TTA, FPN BCE+Dice had mean Dice
+0.839 +/- 0.191 on the 196 overlapping sessile-subset images and 0.730 +/-
+0.234 on the 13 images whose target boxes cover at most 2% of the frame.
+The small-box sample is very limited and has high variability; these results
+do not establish reliable performance on small or flat polyps. Pixel
+specificity is measured on positive Kvasir-SEG frames and is not clinical
+specificity on normal patients. No confidence intervals, significance tests,
+external validation, or clinical claims are made.
+
+The full-precision fold summaries and subgroup results are in
+[benchmark_comparison.csv](reports/advanced_benchmark/benchmark_comparison.csv)
+and
+[subgroup_comparison.csv](reports/advanced_benchmark/subgroup_comparison.csv).
+The chart is
+[ablation_and_model_comparison.png](reports/advanced_benchmark/ablation_and_model_comparison.png).
 
 ## Pipeline details
 
@@ -502,10 +562,9 @@ plots are kept under `reports/full_benchmark/`.
 ## Scope and limitations
 
 - The completed 13-experiment benchmark used randomly initialized encoders.
-  The separate advanced benchmark uses ImageNet-pretrained encoders and adds
-  SegFormer/MiT-B0 and UPerNet/MiT-B0 transformer models with four-view TTA.
-  The advanced run is resumable and its results are not final until all five
-  outer folds of each configuration complete.
+  The separate completed advanced benchmark uses ImageNet-pretrained encoders
+  and adds SegFormer/MiT-B0 and UPerNet/MiT-B0 transformer models with four-view
+  TTA. All six configurations have five outer-fold evaluations.
 - HarDNet-MSEG, Polyp-PVT, and MedSAM 2 were not included. SegFormer and
   UPerNet are general transformer segmentation architectures, not substitutes
   for those polyp-specific or foundation-model implementations.
