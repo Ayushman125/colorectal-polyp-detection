@@ -6,6 +6,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from .specialized_models import PraNetStyle, TransFuseStyle
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -24,15 +26,26 @@ MODEL_SPECS = {
     "deeplabv3plus_resnet34": ModelSpec("DeepLabV3Plus", "resnet34"),
     "segformer_mit_b0": ModelSpec("Segformer", "mit_b0"),
     "upernet_mit_b0": ModelSpec("UPerNet", "mit_b0"),
+    "pranet_resnet34": ModelSpec("PraNetStyle", "resnet34"),
+    "transfuse_resnet34_swin_tiny": ModelSpec("TransFuseStyle", "resnet34+swin_tiny"),
 }
 
 
-def build_model(name: str, pretrained_encoder: bool = False) -> nn.Module:
+DEEP_SUPERVISION_MODELS = {"pranet_resnet34", "transfuse_resnet34_swin_tiny"}
+
+
+def build_model(
+    name: str, pretrained_encoder: bool = False, image_size: int = 352
+) -> nn.Module:
     """Build a real SMP segmentation model with a single foreground logit."""
     if name not in MODEL_SPECS:
         raise ValueError(
             f"Unknown model {name!r}. Available models: {', '.join(MODEL_SPECS)}"
         )
+    if name == "pranet_resnet34":
+        return PraNetStyle(pretrained=pretrained_encoder)
+    if name == "transfuse_resnet34_swin_tiny":
+        return TransFuseStyle(pretrained=pretrained_encoder, image_size=image_size)
     try:
         import segmentation_models_pytorch as smp
     except ImportError as error:
@@ -140,3 +153,24 @@ def segmentation_loss(name: str, logits: torch.Tensor, target: torch.Tensor) -> 
     if name == "dice_boundary":
         return dice_boundary_loss(logits, target)
     raise ValueError(f"Unsupported loss: {name}")
+
+
+def segmentation_objective(
+    name: str,
+    outputs: torch.Tensor | tuple[torch.Tensor, ...],
+    target: torch.Tensor,
+    deep_supervision: bool = False,
+) -> torch.Tensor:
+    if isinstance(outputs, torch.Tensor):
+        if deep_supervision:
+            raise ValueError("Deep supervision requires a model with auxiliary outputs")
+        return segmentation_loss(name, outputs, target)
+    if not outputs:
+        raise ValueError("A segmentation model must return at least one output")
+    if not deep_supervision:
+        return segmentation_loss(name, outputs[0], target)
+    weights = (1.0, 0.4, 0.2, 0.1)
+    return sum(
+        weight * segmentation_loss(name, output, target)
+        for weight, output in zip(weights, outputs)
+    )

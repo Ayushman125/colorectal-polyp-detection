@@ -11,6 +11,7 @@ from .data import discover_cases
 from .deep import train_cross_validation
 from .models import MODEL_SPECS
 from .report import generate_report
+from .specialized_benchmark import run_specialized_benchmark
 
 
 def _common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -111,6 +112,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     advanced.add_argument("--no-overlays", action="store_true")
 
+    specialized = commands.add_parser(
+        "specialized-benchmark",
+        help="Run/resume PraNet-style and TransFuse-style architecture ablations.",
+    )
+    specialized.add_argument(
+        "--dataset-root", type=Path, default=Path("kvasir-seg") / "Kvasir-SEG"
+    )
+    specialized.add_argument(
+        "--aux-dataset-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Optional extra paired dataset with images/ and masks/; may be repeated.",
+    )
+    specialized.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("runs") / "specialized_benchmark",
+    )
+    specialized.add_argument("--folds", type=int, default=5)
+    specialized.add_argument("--seed", type=int, default=42)
+    specialized.add_argument("--size", type=int, default=352)
+    specialized.add_argument("--batch-size", type=int, default=2)
+    specialized.add_argument("--epochs", type=int, default=30)
+    specialized.add_argument("--patience", type=int, default=6)
+    specialized.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    specialized.add_argument("--num-workers", type=int, default=0)
+    specialized.add_argument(
+        "--sessile-image-dir",
+        type=Path,
+        default=Path("kvasir-sessile") / "sessile-main-Kvasir-SEG" / "images",
+    )
+    specialized.add_argument(
+        "--dense-crf",
+        action="store_true",
+        help="Evaluate DenseCRF post-processing; requires optional pydensecrf.",
+    )
+    specialized.add_argument("--no-overlays", action="store_true")
+
     status = commands.add_parser(
         "status", help="Show completed, running, and pending benchmark experiments."
     )
@@ -184,6 +224,37 @@ def main() -> None:
             device_name=args.device,
             num_workers=args.num_workers,
             sessile_case_ids=sessile_case_ids,
+            overlays=not args.no_overlays,
+        )
+        print(json.dumps(state, indent=2))
+    elif args.command == "specialized-benchmark":
+        auxiliary_cases = []
+        for index, dataset_root in enumerate(args.aux_dataset_root, start=1):
+            auxiliary_cases.extend(
+                discover_cases(
+                    dataset_root,
+                    case_id_prefix=f"aux{index}_{dataset_root.name}",
+                )
+            )
+        sessile_case_ids = (
+            {path.stem for path in args.sessile_image_dir.glob("*") if path.is_file()}
+            if args.sessile_image_dir.is_dir()
+            else set()
+        )
+        state = run_specialized_benchmark(
+            cases,
+            args.output_dir,
+            auxiliary_cases=auxiliary_cases,
+            n_splits=args.folds,
+            seed=args.seed,
+            image_size=args.size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            patience=args.patience,
+            device_name=args.device,
+            num_workers=args.num_workers,
+            sessile_case_ids=sessile_case_ids,
+            dense_crf=args.dense_crf,
             overlays=not args.no_overlays,
         )
         print(json.dumps(state, indent=2))

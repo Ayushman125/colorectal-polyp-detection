@@ -29,6 +29,14 @@ METRICS = (
     "tta_box_precision",
     "tta_box_recall",
     "tta_inference_fps",
+    "crf_dice",
+    "crf_miou",
+    "crf_sensitivity",
+    "crf_specificity",
+    "crf_ap50",
+    "crf_box_precision",
+    "crf_box_recall",
+    "crf_inference_fps",
 )
 
 
@@ -43,7 +51,7 @@ def _read_result_rows(root: Path) -> list[dict[str, Any]]:
                     tta_row = {
                         key: value
                         for key, value in row.items()
-                        if not key.startswith("tta_")
+                        if not key.startswith(("tta_", "crf_"))
                     }
                     tta_row["model"] = f"{row['model']}_tta"
                     for metric in (
@@ -58,6 +66,25 @@ def _read_result_rows(root: Path) -> list[dict[str, Any]]:
                     ):
                         tta_row[metric] = row.get(f"tta_{metric}", "")
                     rows.append(tta_row)
+                if row.get("crf_dice") not in (None, ""):
+                    crf_row = {
+                        key: value
+                        for key, value in row.items()
+                        if not key.startswith(("crf_", "tta_"))
+                    }
+                    crf_row["model"] = f"{row['model']}_crf"
+                    for metric in (
+                        "dice",
+                        "miou",
+                        "sensitivity",
+                        "specificity",
+                        "ap50",
+                        "box_precision",
+                        "box_recall",
+                        "inference_fps",
+                    ):
+                        crf_row[metric] = row.get(f"crf_{metric}", "")
+                    rows.append(crf_row)
     for path in root.rglob("classical_metrics.json"):
         rows.extend(json.loads(path.read_text(encoding="utf-8")))
     if not rows:
@@ -69,24 +96,30 @@ def _read_result_rows(root: Path) -> list[dict[str, Any]]:
 
 def generate_report(input_dir: Path, output_dir: Path) -> Path:
     rows = _read_result_rows(input_dir)
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         key = (
             str(row.get("model", "unknown")),
             str(row.get("preprocessing", "unknown")),
             str(row.get("loss", "not_applicable")),
+            str(row.get("deep_supervision", "0")),
+            str(row.get("small_polyp_crop_probability", "0")),
+            str(row.get("auxiliary_training_cases", "0")),
         )
         grouped[key].append(row)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     table_path = output_dir / "benchmark_comparison.csv"
     report_rows: list[dict[str, Any]] = []
-    for (model, preprocessing, loss), group in sorted(grouped.items()):
+    for (model, preprocessing, loss, deep_supervision, crop_probability, auxiliary_count), group in sorted(grouped.items()):
         record: dict[str, Any] = {
             "model": model,
             "preprocessing": preprocessing,
             "loss": loss,
             "folds": len(group),
+            "deep_supervision": deep_supervision,
+            "small_polyp_crop_probability": crop_probability,
+            "auxiliary_training_cases": auxiliary_count,
         }
         for metric in METRICS:
             values = []
@@ -120,21 +153,37 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
         with path.open(newline="", encoding="utf-8") as file:
             image_rows = list(csv.DictReader(file))
         grouped_images: dict[
-            tuple[str, str, str], list[dict[str, str]]
+            tuple[str, str, str, str, str, str, str], list[dict[str, str]]
         ] = defaultdict(list)
         for row in image_rows:
-            grouped_images[
-                (
+            model_name = row.get("model", config.get("model", "unknown"))
+            variants = (
+                [("_tta", "")]
+                if is_tta
+                else [("", "")]
+                + ([("_crf", "crf_")] if row.get("crf_dice", "") else [])
+            )
+            for suffix, metric_prefix in variants:
+                grouped_images[
                     (
-                        f"{row.get('model', config.get('model', 'unknown'))}_tta"
-                        if is_tta
-                        else row.get("model", config.get("model", "unknown"))
-                    ),
-                    row.get("loss", config.get("loss", "not_applicable")),
-                    row.get("preprocessing", config.get("preprocessing", "unknown")),
-                )
-            ].append(row)
-        for (model, loss, preprocessing), model_rows in grouped_images.items():
+                        f"{model_name}{suffix}",
+                        row.get("loss", config.get("loss", "not_applicable")),
+                        row.get("preprocessing", config.get("preprocessing", "unknown")),
+                        str(int(bool(config.get("deep_supervision", False)))),
+                        str(config.get("small_polyp_crop_probability", 0.0)),
+                        str(len(config.get("auxiliary_case_ids", []))),
+                        metric_prefix,
+                    )
+                ].append(row)
+        for (
+            model,
+            loss,
+            preprocessing,
+            deep_supervision,
+            crop_probability,
+            auxiliary_count,
+            metric_prefix,
+        ), model_rows in grouped_images.items():
             groups = {
                 "sessile_subset": [
                     row
@@ -164,11 +213,17 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
                     "model": model,
                     "loss": loss,
                     "preprocessing": preprocessing,
+                    "deep_supervision": deep_supervision,
+                    "small_polyp_crop_probability": crop_probability,
+                    "auxiliary_training_cases": auxiliary_count,
                     "subgroup": subgroup,
                     "image_count": len(selected_rows),
                 }
                 for metric in ("dice", "miou", "sensitivity", "specificity"):
-                    values = [float(row[metric]) for row in selected_rows]
+                    values = [
+                        float(row[f"{metric_prefix}{metric}"])
+                        for row in selected_rows
+                    ]
                     subgroup_record[f"{metric}_mean"] = mean(values)
                     subgroup_record[f"{metric}_std"] = (
                         stdev(values) if len(values) > 1 else 0.0
@@ -193,7 +248,9 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
         import matplotlib.pyplot as plt
 
         labels = [
-            f"{row['model']}\n{row['preprocessing']} / {row['loss']}"
+            f"{row['model']}\n{row['preprocessing']} / {row['loss']}\n"
+            f"DS={row['deep_supervision']} crop={row['small_polyp_crop_probability']} "
+            f"aux={row['auxiliary_training_cases']}"
             for row in deep_groups
         ]
         x_positions = list(range(len(labels)))

@@ -58,7 +58,7 @@ class NonSingletonBatchSampler(Sampler[list[int]]):
         yield from batches
 
 
-def discover_cases(dataset_root: Path) -> list[Case]:
+def discover_cases(dataset_root: Path, case_id_prefix: str | None = None) -> list[Case]:
     """Find strictly paired image/mask files; fail rather than silently drop cases."""
     image_dir = dataset_root / "images"
     mask_dir = dataset_root / "masks"
@@ -113,7 +113,7 @@ def discover_cases(dataset_root: Path) -> list[Case]:
         )
         cases.append(
             Case(
-                case_id,
+                f"{case_id_prefix}__{case_id}" if case_id_prefix else case_id,
                 image_paths[case_id],
                 mask_paths[case_id],
                 int(annotation["width"]) if "width" in annotation else None,
@@ -202,6 +202,7 @@ class KvasirDataset(Dataset[tuple[torch.Tensor, torch.Tensor, str]]):
         augment: bool = False,
         remove_specular: bool = True,
         imagenet_normalize: bool = False,
+        small_polyp_crop_probability: float = 0.0,
     ) -> None:
         self.cases = cases
         self.size = size
@@ -209,6 +210,9 @@ class KvasirDataset(Dataset[tuple[torch.Tensor, torch.Tensor, str]]):
         self.augment = augment
         self.remove_specular = remove_specular
         self.imagenet_normalize = imagenet_normalize
+        if not 0.0 <= small_polyp_crop_probability <= 1.0:
+            raise ValueError("small_polyp_crop_probability must be between 0 and 1")
+        self.small_polyp_crop_probability = small_polyp_crop_probability
         if size < 32:
             raise ValueError("size must be at least 32 pixels")
 
@@ -241,6 +245,42 @@ class KvasirDataset(Dataset[tuple[torch.Tensor, torch.Tensor, str]]):
             image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
         return image, mask
 
+    def _crop_around_small_polyp(
+        self, image: np.ndarray, mask: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if (
+            not self.augment
+            or self.small_polyp_crop_probability == 0.0
+            or random.random() >= self.small_polyp_crop_probability
+            or float(mask.mean()) > 0.02
+        ):
+            return image, mask
+
+        rows, columns = np.nonzero(mask)
+        if not len(rows):
+            return image, mask
+        height, width = mask.shape
+        box_width = int(columns.max() - columns.min() + 1)
+        box_height = int(rows.max() - rows.min() + 1)
+        crop_size = min(
+            min(height, width),
+            max(int(max(box_width, box_height) * 2.5), int(self.size * 0.35)),
+        )
+        crop_size = min(crop_size, int(self.size * 0.75))
+        center_x = int((columns.min() + columns.max()) / 2)
+        center_y = int((rows.min() + rows.max()) / 2)
+        jitter = crop_size // 8
+        center_x += random.randint(-jitter, jitter)
+        center_y += random.randint(-jitter, jitter)
+        left = min(max(center_x - crop_size // 2, 0), width - crop_size)
+        top = min(max(center_y - crop_size // 2, 0), height - crop_size)
+        image_crop = image[top : top + crop_size, left : left + crop_size]
+        mask_crop = mask[top : top + crop_size, left : left + crop_size]
+        return (
+            cv2.resize(image_crop, (self.size, self.size), interpolation=cv2.INTER_LINEAR),
+            cv2.resize(mask_crop, (self.size, self.size), interpolation=cv2.INTER_NEAREST),
+        )
+
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, str]:
         case = self.cases[index]
         bgr = cv2.imread(str(case.image_path), cv2.IMREAD_COLOR)
@@ -270,6 +310,7 @@ class KvasirDataset(Dataset[tuple[torch.Tensor, torch.Tensor, str]]):
         mask = (mask > 0).astype(np.uint8)
         if self.augment:
             image, mask = self._augment_pair(image, mask)
+            image, mask = self._crop_around_small_polyp(image, mask)
 
         image_tensor = torch.from_numpy(
             np.ascontiguousarray(image.transpose(2, 0, 1))

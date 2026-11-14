@@ -283,6 +283,116 @@ and
 The chart is
 [ablation_and_model_comparison.png](reports/advanced_benchmark/ablation_and_model_comparison.png).
 
+## Specialized architecture, small-lesion, and refinement studies
+
+The `specialized-benchmark` command adds two research implementations:
+
+- **PraNet-style reverse attention:** ImageNet-pretrained ResNet-34 features are
+  decoded from coarse to fine. Each refinement stage gates features with
+  `1 - sigmoid(previous_logit)` and predicts a residual mask correction.
+- **TransFuse-style hybrid fusion:** ImageNet-pretrained ResNet-34 and
+  Swin-Tiny feature pyramids are projected to a shared width, fused with
+  reciprocal learned gates, and decoded with auxiliary output heads.
+
+These are documented, locally implemented PraNet-/TransFuse-style models; they
+are not claimed to be bit-for-bit reproductions of the papers' official code or
+checkpoints. Both emit full-resolution logits at multiple scales. The
+deep-supervision objective is
+`L_final + 0.4 L_aux1 + 0.2 L_aux2`, with each term using the same BCE+soft-Dice
+loss and ground-truth mask. Ablation cells compare deep supervision on/off and
+small-lesion crops on/off.
+
+For training only, the crop condition selects a case with probability 0.5 when
+its resized foreground mask occupies at most 2% of the frame. A square crop
+centered near the mask is expanded to retain context and resized to the model
+input size. Validation and outer-test images are never cropped. This is a
+training sampling intervention, not an independent small-polyp test set.
+
+### Optional joint training with other datasets
+
+No CVC-ClinicDB, CVC-ColonDB, or ETIS data was present in the workspace when
+this pipeline was prepared. To enable the joint-training comparison, arrange
+each additional dataset in the same paired layout (`images/` and `masks/`)
+and pass one or more roots using repeated `--aux-dataset-root` arguments. The
+outer folds, validation and reported metrics remain based only on Kvasir-SEG;
+auxiliary cases are included in training only. Exact duplicate decoded images
+between an auxiliary root and an outer-test fold are excluded from that fold's
+auxiliary training set and recorded in its split manifest. This exact-pixel
+check does not guarantee detection of resized or otherwise altered duplicates.
+
+Example (edit paths to the locally installed datasets):
+
+```powershell
+python -m polyp_pipeline specialized-benchmark `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --aux-dataset-root "datasets\CVC-ClinicDB" `
+  --aux-dataset-root "datasets\CVC-ColonDB" `
+  --aux-dataset-root "datasets\ETIS-LaribPolypDB" `
+  --output-dir "runs\specialized_joint" `
+  --folds 5 --seed 42 --size 352 `
+  --batch-size 2 --epochs 30 --patience 6 --device cuda
+```
+
+The auxiliary roots must contain compatible binary segmentation masks. Convert
+other dataset formats to paired images/masks before running; the command fails
+on unpaired filenames rather than silently ignoring them. Joint training is
+not the same protocol as pretraining on all external datasets followed by a
+separate Kvasir fine-tune; the runner jointly samples auxiliary and Kvasir
+outer-training cases while keeping the Kvasir validation/test folds isolated.
+
+### DenseCRF and execution
+
+DenseCRF is optional and is applied to ordinary-inference probability maps
+using Gaussian and bilateral pairwise terms. It reports a separate `*_crf`
+row beside the unrefined result; it is not trained and its parameters are not
+selected on the outer test folds. On Windows, `pydensecrf2` may require
+Microsoft C++ Build Tools to compile:
+
+```powershell
+python -m pip install pydensecrf2==1.1
+```
+
+The Windows environment used for this run lacked those build tools, so DenseCRF
+could not be installed or empirically evaluated here. Without that optional
+package, omit `--dense-crf`; requesting it fails before training with an
+installation message.
+
+Run the Kvasir-only architecture and ablation matrix:
+
+```powershell
+python -m polyp_pipeline specialized-benchmark `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "runs\specialized_benchmark" `
+  --folds 5 --seed 42 --size 352 `
+  --batch-size 2 --epochs 30 --patience 6 --device cuda --no-overlays
+```
+
+Add `--dense-crf` only after installing the optional dependency. Monitor or
+resume by rerunning the identical command and check progress with:
+
+```powershell
+python -m polyp_pipeline status --input-dir "runs\specialized_benchmark"
+```
+
+The runner checkpoints after every epoch and records outer-fold manifests,
+including auxiliary training IDs and exact duplicate exclusions. The five
+Kvasir-only comparison cells cover PraNet-style baseline, PraNet-style deep
+supervision, PraNet-style deep supervision plus small-lesion cropping,
+TransFuse-style baseline, and TransFuse-style deep supervision plus cropping.
+When auxiliary datasets are supplied, two matched joint-training cells are
+added. CRF, when enabled, is a paired post-processing ablation for each cell.
+The comparison report uses the same standard command:
+
+```powershell
+python -m polyp_pipeline report `
+  --input-dir "runs\specialized_benchmark" `
+  --output-dir "reports\specialized_benchmark"
+```
+
+The target Dice range of 0.93-0.95 is an experimental goal, not a guaranteed
+outcome. Report only completed held-out results; do not tune architecture,
+thresholds, or CRF parameters against outer-test metrics.
+
 ## Pipeline details
 
 ### Preprocessing and augmentation

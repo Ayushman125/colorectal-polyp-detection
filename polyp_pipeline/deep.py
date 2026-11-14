@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import platform
@@ -33,7 +34,28 @@ from .metrics import (
     segmentation_counts,
     segmentation_metrics,
 )
-from .models import MODEL_SPECS, build_model, segmentation_loss
+from .models import (
+    DEEP_SUPERVISION_MODELS,
+    MODEL_SPECS,
+    build_model,
+    segmentation_objective,
+)
+
+
+def _final_logits(
+    outputs: torch.Tensor | tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    return outputs if isinstance(outputs, torch.Tensor) else outputs[0]
+
+
+def _image_content_hash(case: Case) -> str:
+    image = cv2.imread(str(case.image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise OSError(f"Could not read image for case {case.case_id}")
+    digest = hashlib.sha256()
+    digest.update(str(image.shape).encode("ascii"))
+    digest.update(np.ascontiguousarray(image).tobytes())
+    return digest.hexdigest()
 
 
 def _atomic_json_write(path: Path, payload: object) -> None:
@@ -155,6 +177,7 @@ def _make_loader(
     augment: bool = False,
     workers: int = 0,
     imagenet_normalize: bool = False,
+    small_polyp_crop_probability: float = 0.0,
 ) -> DataLoader:
     dataset = KvasirDataset(
         cases,
@@ -163,6 +186,7 @@ def _make_loader(
         augment=augment,
         remove_specular=True,
         imagenet_normalize=imagenet_normalize,
+        small_polyp_crop_probability=small_polyp_crop_probability,
     )
     loader_options = {
         "num_workers": workers,
@@ -194,7 +218,7 @@ def _validate_epoch(
     with torch.inference_mode():
         for images, masks, _ in loader:
             images = images.to(device, non_blocking=True)
-            logits = model(images)
+            logits = _final_logits(model(images))
             predictions = torch.sigmoid(logits).cpu().numpy()[:, 0] >= threshold
             targets = masks.numpy()[:, 0] > 0
             for target, prediction in zip(targets, predictions):
@@ -214,6 +238,7 @@ def _predict_outer_test(
     write_overlays: bool,
     sessile_case_ids: set[str],
     test_time_augmentation: bool = False,
+    dense_crf: bool = False,
 ) -> tuple[dict[str, float], list[dict[str, object]]]:
     model.eval()
     sum_counts = np.zeros(4, dtype=np.int64)
@@ -224,11 +249,22 @@ def _predict_outer_test(
     ] = []
     detection_targets: list[tuple[str, tuple[int, int, int, int]]] = []
     inference_seconds = 0.0
+    crf_seconds = 0.0
+    crf_image_metrics: list[dict[str, float]] = []
+    crf_sum_counts = np.zeros(4, dtype=np.int64)
+    crf_predictions: list[
+        tuple[str, tuple[int, int, int, int], float]
+    ] = []
     case_by_id = _case_map(cases)
     prediction_dir = output_dir / (
         "predictions_tta" if test_time_augmentation else "predictions"
     )
     prediction_dir.mkdir(parents=True, exist_ok=True)
+    if dense_crf:
+        from .refinement import dense_crf_refine
+
+        crf_prediction_dir = output_dir / "predictions_crf"
+        crf_prediction_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.inference_mode():
         for images, masks, case_ids in loader:
@@ -237,16 +273,20 @@ def _predict_outer_test(
                 torch.cuda.synchronize(device)
             start = time.perf_counter()
             if test_time_augmentation:
-                probability_views = [torch.sigmoid(model(images))]
+                probability_views = [
+                    torch.sigmoid(_final_logits(model(images)))
+                ]
                 for dimensions in ((3,), (2,), (2, 3)):
                     transformed = torch.flip(images, dims=dimensions)
-                    transformed_probabilities = torch.sigmoid(model(transformed))
+                    transformed_probabilities = torch.sigmoid(
+                        _final_logits(model(transformed))
+                    )
                     probability_views.append(
                         torch.flip(transformed_probabilities, dims=dimensions)
                     )
                 probabilities = torch.stack(probability_views).mean(dim=0)
             else:
-                probabilities = torch.sigmoid(model(images))
+                probabilities = torch.sigmoid(_final_logits(model(images)))
             probabilities = probabilities.cpu().numpy()[:, 0]
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -262,6 +302,33 @@ def _predict_outer_test(
                 sum_counts += np.asarray(segmentation_counts(target, prediction))
                 case = case_by_id[case_id]
                 target_boxes = _scaled_annotation_boxes(case, size, target)
+                crf_metrics: dict[str, float] = {}
+                if dense_crf and not test_time_augmentation:
+                    crf_started = time.perf_counter()
+                    original = cv2.imread(str(case.image_path), cv2.IMREAD_COLOR)
+                    if original is None:
+                        raise OSError(f"Could not read image for case {case_id}")
+                    original = cv2.cvtColor(
+                        cv2.resize(original, (size, size)), cv2.COLOR_BGR2RGB
+                    )
+                    crf_probability = dense_crf_refine(original, probability)
+                    crf_seconds += time.perf_counter() - crf_started
+                    crf_prediction = (crf_probability >= threshold).astype(np.uint8)
+                    crf_metrics = segmentation_metrics(target, crf_prediction)
+                    crf_image_metrics.append(crf_metrics)
+                    crf_sum_counts += np.asarray(
+                        segmentation_counts(target, crf_prediction)
+                    )
+                    crf_predictions.extend(
+                        (case_id, box, score)
+                        for box, score in predicted_boxes_with_scores(
+                            crf_probability, threshold
+                        )
+                    )
+                    cv2.imwrite(
+                        str(crf_prediction_dir / f"{case_id}.png"),
+                        (crf_probability * 255).clip(0, 255).astype(np.uint8),
+                    )
                 target_area_fraction = (
                     sum(
                         (box[2] - box[0]) * (box[3] - box[1])
@@ -277,6 +344,10 @@ def _predict_outer_test(
                         "target_box_count": len(target_boxes),
                         "target_box_area_fraction": target_area_fraction,
                         "is_sessile_subset": case_id in sessile_case_ids,
+                        **{
+                            f"crf_{key}": value
+                            for key, value in crf_metrics.items()
+                        },
                     }
                 )
                 detection_targets.extend(
@@ -328,7 +399,7 @@ def _predict_outer_test(
     box_precision, box_recall = detection_precision_recall(
         detection_predictions, detection_targets
     )
-    return {
+    result = {
         "dice": float(np.mean([metric["dice"] for metric in image_metrics])),
         "miou": float(np.mean([metric["miou"] for metric in image_metrics])),
         "sensitivity": float(tp / (tp + fn + 1e-8)),
@@ -338,7 +409,34 @@ def _predict_outer_test(
         "box_recall": box_recall,
         "inference_fps": float(len(cases) / max(inference_seconds, 1e-8)),
         "inference_seconds": float(inference_seconds),
-    }, per_image_rows
+    }
+    if dense_crf and not test_time_augmentation:
+        crf_tp, crf_fp, crf_fn, crf_tn = crf_sum_counts.tolist()
+        crf_box_precision, crf_box_recall = detection_precision_recall(
+            crf_predictions, detection_targets
+        )
+        result.update(
+            {
+                "crf_dice": float(
+                    np.mean([metric["dice"] for metric in crf_image_metrics])
+                ),
+                "crf_miou": float(
+                    np.mean([metric["miou"] for metric in crf_image_metrics])
+                ),
+                "crf_sensitivity": float(crf_tp / (crf_tp + crf_fn + 1e-8)),
+                "crf_specificity": float(crf_tn / (crf_tn + crf_fp + 1e-8)),
+                "crf_ap50": average_precision_50(
+                    crf_predictions, detection_targets
+                ),
+                "crf_box_precision": crf_box_precision,
+                "crf_box_recall": crf_box_recall,
+                "crf_inference_fps": float(
+                    len(cases) / max(inference_seconds + crf_seconds, 1e-8)
+                ),
+                "crf_seconds": float(crf_seconds),
+            }
+        )
+    return result, per_image_rows
 
 
 def train_cross_validation(
@@ -363,9 +461,33 @@ def train_cross_validation(
     progress_log_path: Path | None = None,
     sessile_case_ids: set[str] | None = None,
     test_time_augmentation: bool = False,
+    deep_supervision: bool = False,
+    small_polyp_crop_probability: float = 0.0,
+    auxiliary_cases: list[Case] | None = None,
+    dense_crf: bool = False,
 ) -> list[dict[str, float | int | str]]:
     if model_name not in MODEL_SPECS:
         raise ValueError(f"Unsupported model: {model_name}")
+    if deep_supervision and model_name not in DEEP_SUPERVISION_MODELS:
+        raise ValueError(
+            f"{model_name} does not provide auxiliary outputs for deep supervision"
+        )
+    if not 0.0 <= small_polyp_crop_probability <= 1.0:
+        raise ValueError("small_polyp_crop_probability must be between 0 and 1")
+    auxiliary_cases = auxiliary_cases or []
+    auxiliary_ids = [case.case_id for case in auxiliary_cases]
+    if len(auxiliary_ids) != len(set(auxiliary_ids)):
+        raise ValueError("Auxiliary dataset case IDs must be unique")
+    if set(auxiliary_ids) & {case.case_id for case in cases}:
+        raise ValueError("Auxiliary and Kvasir case IDs must be disjoint")
+    if dense_crf:
+        from .refinement import dense_crf_refine
+
+        dense_crf_refine(
+            np.zeros((2, 2, 3), dtype=np.uint8),
+            np.full((2, 2), 0.5, dtype=np.float32),
+            iterations=1,
+        )
     if device_name == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA was requested but is unavailable. Install a CUDA-enabled PyTorch "
@@ -377,6 +499,9 @@ def train_cross_validation(
     write_fold_manifest(output_dir / "folds.json", cases, folds, seed)
     progress_log = progress_log_path or output_dir / "progress.jsonl"
     sessile_case_ids = sessile_case_ids or set()
+    auxiliary_hashes = {
+        case.case_id: _image_content_hash(case) for case in auxiliary_cases
+    }
     run_config = {
         "model": model_name,
         "loss": loss_name,
@@ -391,6 +516,10 @@ def train_cross_validation(
         "threshold": threshold,
         "device": device_name,
         "pretrained_encoder": pretrained_encoder,
+        "deep_supervision": deep_supervision,
+        "small_polyp_crop_probability": small_polyp_crop_probability,
+        "auxiliary_case_ids": auxiliary_ids,
+        "dense_crf": dense_crf,
         "case_ids": [case.case_id for case in cases],
         "sessile_case_ids": sorted(sessile_case_ids),
         "max_epochs": epochs,
@@ -479,12 +608,27 @@ def train_cross_validation(
             "validation_ids": validation_ids,
             "test_ids": fold["test_ids"],
         }
-        (fold_dir / "split_manifest.json").write_text(
-            json.dumps(split_manifest, indent=2), encoding="utf-8"
-        )
         training_cases = [by_id[case_id] for case_id in train_ids]
         validation_cases = [by_id[case_id] for case_id in validation_ids]
         test_cases = [by_id[case_id] for case_id in fold["test_ids"]]
+        test_image_hashes = {_image_content_hash(case) for case in test_cases}
+        fold_auxiliary_cases = [
+            case
+            for case in auxiliary_cases
+            if auxiliary_hashes[case.case_id] not in test_image_hashes
+        ]
+        split_manifest["auxiliary_train_ids"] = [
+            case.case_id for case in fold_auxiliary_cases
+        ]
+        split_manifest["auxiliary_excluded_test_duplicates"] = [
+            case.case_id
+            for case in auxiliary_cases
+            if auxiliary_hashes[case.case_id] in test_image_hashes
+        ]
+        (fold_dir / "split_manifest.json").write_text(
+            json.dumps(split_manifest, indent=2), encoding="utf-8"
+        )
+        effective_training_cases = training_cases + fold_auxiliary_cases
 
         # Assert image-level isolation before creating loaders.
         if (
@@ -496,7 +640,7 @@ def train_cross_validation(
 
         _seed_everything(seed + fold_index)
         train_loader = _make_loader(
-            training_cases,
+            effective_training_cases,
             image_size,
             preprocessing,
             batch_size,
@@ -504,6 +648,7 @@ def train_cross_validation(
             augment=True,
             workers=num_workers,
             imagenet_normalize=pretrained_encoder,
+            small_polyp_crop_probability=small_polyp_crop_probability,
         )
         validation_loader = _make_loader(
             validation_cases,
@@ -515,7 +660,7 @@ def train_cross_validation(
             imagenet_normalize=pretrained_encoder,
         )
 
-        model = build_model(model_name, pretrained_encoder)
+        model = build_model(model_name, pretrained_encoder, image_size=image_size)
         parameters_m, gflops_per_image = _model_complexity(model, image_size)
         model = model.to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -591,8 +736,10 @@ def train_cross_validation(
                 masks = masks.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                    logits = model(images)
-                    loss = segmentation_loss(loss_name, logits, masks)
+                    outputs = model(images)
+                    loss = segmentation_objective(
+                        loss_name, outputs, masks, deep_supervision
+                    )
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -604,7 +751,7 @@ def train_cross_validation(
             scheduler.step(validation_dice)
             epoch_record = {
                 "epoch": epoch + 1,
-                "train_loss": total_loss / max(1, len(training_cases)),
+                "train_loss": total_loss / max(1, len(effective_training_cases)),
                 "validation_dice": validation_dice,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "epoch_seconds": time.perf_counter() - epoch_started,
@@ -629,6 +776,8 @@ def train_cross_validation(
                         "model_state": best_model_state,
                         "model_name": model_name,
                         "loss_name": loss_name,
+                        "deep_supervision": deep_supervision,
+                        "small_polyp_crop_probability": small_polyp_crop_probability,
                         "preprocessing": preprocessing,
                         "image_size": image_size,
                         "threshold": threshold,
@@ -698,6 +847,7 @@ def train_cross_validation(
             image_size,
             overlays,
             sessile_case_ids,
+            dense_crf=dense_crf,
         )
         tta_per_image_rows: list[dict[str, object]] = []
         if test_time_augmentation:
@@ -746,6 +896,9 @@ def train_cross_validation(
             "parameters_m": parameters_m,
             "gflops_per_image": gflops_per_image,
             "profiled_image_size": image_size,
+            "deep_supervision": int(deep_supervision),
+            "small_polyp_crop_probability": small_polyp_crop_probability,
+            "auxiliary_training_cases": len(fold_auxiliary_cases),
             **test_metrics,
         }
         result.update(
@@ -794,6 +947,21 @@ def train_cross_validation(
                 "box_precision",
                 "box_recall",
                 "inference_fps",
+            )
+        )
+    if dense_crf:
+        metric_names += tuple(
+            f"crf_{metric}"
+            for metric in (
+                "dice",
+                "miou",
+                "sensitivity",
+                "specificity",
+                "ap50",
+                "box_precision",
+                "box_recall",
+                "inference_fps",
+                "seconds",
             )
         )
     if len(completed_folds) == n_splits:
