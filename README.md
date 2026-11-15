@@ -396,7 +396,8 @@ python -m polyp_pipeline external-evaluate `
 For comparison against the Kvasir-only architecture runs, evaluate those
 checkpoints separately by setting `--input-dir "runs\specialized_benchmark"`.
 External fold metrics are saved as `external_metrics.csv` and
-`external_summary.json`; combine the Kvasir-only and joint results with:
+`external_metrics_summary.json`; combine the Kvasir-only and joint results
+with:
 
 ```powershell
 python -m polyp_pipeline report `
