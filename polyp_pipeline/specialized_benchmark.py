@@ -13,7 +13,7 @@ from .deep import _log_progress, train_cross_validation
 
 
 def specialized_benchmark_plan(
-    use_auxiliary_data: bool,
+    use_auxiliary_data: bool, joint_only: bool = False
 ) -> list[dict[str, str | bool | float]]:
     plan: list[dict[str, str | bool | float]] = [
         {
@@ -64,6 +64,12 @@ def specialized_benchmark_plan(
                 },
             ]
         )
+    if joint_only:
+        if not use_auxiliary_data:
+            raise ValueError("--joint-only requires at least one auxiliary dataset")
+        plan = [
+            item for item in plan if item["data_condition"] == "joint_auxiliary"
+        ]
     return plan
 
 
@@ -96,6 +102,7 @@ def run_specialized_benchmark(
     sessile_case_ids: set[str] | None = None,
     dense_crf: bool = False,
     overlays: bool = True,
+    joint_only: bool = False,
 ) -> dict[str, Any]:
     if dense_crf:
         from .refinement import dense_crf_refine
@@ -110,7 +117,9 @@ def run_specialized_benchmark(
     plan_path = output_dir / "benchmark_plan.json"
     progress_path = output_dir / "progress.jsonl"
     auxiliary_cases = auxiliary_cases or []
-    plan = specialized_benchmark_plan(bool(auxiliary_cases))
+    plan = specialized_benchmark_plan(
+        bool(auxiliary_cases), joint_only=joint_only
+    )
     run_config = {
         "dataset_cases": len(cases),
         "auxiliary_cases": len(auxiliary_cases),

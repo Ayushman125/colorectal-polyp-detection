@@ -70,12 +70,14 @@ def discover_cases(dataset_root: Path, case_id_prefix: str | None = None) -> lis
     image_paths = {
         path.stem: path
         for path in image_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        if path.is_file()
+        and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
     }
     mask_paths = {
         path.stem: path
         for path in mask_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        if path.is_file()
+        and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
     }
     missing_masks = sorted(image_paths.keys() - mask_paths.keys())
     missing_images = sorted(mask_paths.keys() - image_paths.keys())

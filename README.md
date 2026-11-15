@@ -55,6 +55,36 @@ added as extra cases and are not an independent external validation cohort.
 The dataset and archive files are not included in this repository. Arrange the
 dataset locally in the layout above before running commands.
 
+### Auxiliary and external datasets
+
+The additional CVC/ETIS data are sourced from the open Zenodo record
+[5579392](https://zenodo.org/records/5579392), which publishes the archive
+`PolypDataset.zip` and MD5 `0c45c453bc16424df7a2528966ccd939`. The archive's
+`NewTRimage`/`NewTRmask` split contains 900 Kvasir cases and 550 CVC-ClinicDB
+cases. Its test split contains 62 CVC-ClinicDB, 380 CVC-ColonDB, 196
+ETIS-LaribPolypDB, 100 Kvasir, and 60 CVC-300 cases.
+
+The preparation command verifies the archive checksum and pair counts,
+identifies and excludes the 900 Kvasir training-set overlaps by case ID, and
+rejects exact decoded-image duplicates across the selected training and test
+splits. It records duplicates within an individual split without discarding
+cases; the external report exposes the duplicate-pair count because those
+cases are not independent observations. It extracts only the 550 CVC-ClinicDB
+auxiliary-training cases plus the three held-out test sets (ClinicDB, ColonDB,
+and ETIS). The archive's Kvasir test subset is deliberately not used:
+Kvasir-SEG is evaluated with the existing five-fold outer cross-validation.
+CVC-300 is not part of this study. The archive contains 34 exact-image
+duplicate pairs in ColonDB and 3 in ETIS; 4 ColonDB pairs and all 3 ETIS pairs
+have different masks. These published test-case counts are retained, but
+observations sharing an image are not independent. The prepared dataset
+manifest records each duplicate pair, split counts, and local paths. The
+combined external report includes an `exact_image_duplicate_pairs` column.
+
+The Zenodo record lists CC-BY 4.0; the original CVC-ClinicDB terms restrict its
+use to research and education. Review the source terms before reuse or
+redistribution. The archive, extracted data, and model checkpoints are local
+runtime data and must not be added to the source repository.
+
 ## End-to-end workflow
 
 The commands in this section use PowerShell and assume the working directory is
@@ -308,37 +338,78 @@ centered near the mask is expanded to retain context and resized to the model
 input size. Validation and outer-test images are never cropped. This is a
 training sampling intervention, not an independent small-polyp test set.
 
-### Optional joint training with other datasets
+### Prepare and run the joint-data study
 
-No CVC-ClinicDB, CVC-ColonDB, or ETIS data was present in the workspace when
-this pipeline was prepared. To enable the joint-training comparison, arrange
-each additional dataset in the same paired layout (`images/` and `masks/`)
-and pass one or more roots using repeated `--aux-dataset-root` arguments. The
-outer folds, validation and reported metrics remain based only on Kvasir-SEG;
-auxiliary cases are included in training only. Exact duplicate decoded images
-between an auxiliary root and an outer-test fold are excluded from that fold's
-auxiliary training set and recorded in its split manifest. This exact-pixel
-check does not guarantee detection of resized or otherwise altered duplicates.
+Download and verify the Zenodo archive, then prepare the 550-case auxiliary
+training set and independent external test sets:
 
-Example (edit paths to the locally installed datasets):
+```powershell
+New-Item -ItemType Directory -Force "D:\PolypDatasets\Zenodo5579392" | Out-Null
+curl.exe --fail --location --retry 5 --retry-all-errors --continue-at - `
+  "https://zenodo.org/api/records/5579392/files/PolypDataset.zip/content" `
+  --output "D:\PolypDatasets\Zenodo5579392\PolypDataset.zip"
+$md5 = (Get-FileHash "D:\PolypDatasets\Zenodo5579392\PolypDataset.zip" -Algorithm MD5).Hash.ToLowerInvariant()
+if ($md5 -ne "0c45c453bc16424df7a2528966ccd939") { throw "Zenodo archive checksum mismatch: $md5" }
+
+python -m polyp_pipeline prepare-zenodo-datasets `
+  --archive "D:\PolypDatasets\Zenodo5579392\PolypDataset.zip" `
+  --kvasir-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "D:\PolypDatasets\prepared"
+```
+
+Preparation produces `clinic_train/` (550 cases), `clinic_test/` (62),
+`colon_test/` (380), and `etis_test/` (196), each with paired `images/` and
+`masks/` directories. It excludes the archive's 900 Kvasir cases from auxiliary
+training by matching source case IDs. The five Kvasir outer folds remain
+unchanged; the auxiliary training set is included only in each fold's training
+portion. The fold manifests record auxiliary IDs and exact-image exclusions
+against that fold's Kvasir test cases.
+
+Run only the two matched joint-training cells (PraNet-style and
+TransFuse-style) with the same five Kvasir folds. Checkpoints are saved after
+each epoch; rerun the identical command to resume:
 
 ```powershell
 python -m polyp_pipeline specialized-benchmark `
   --dataset-root "kvasir-seg\Kvasir-SEG" `
-  --aux-dataset-root "datasets\CVC-ClinicDB" `
-  --aux-dataset-root "datasets\CVC-ColonDB" `
-  --aux-dataset-root "datasets\ETIS-LaribPolypDB" `
-  --output-dir "runs\specialized_joint" `
+  --aux-dataset-root "D:\PolypDatasets\prepared\clinic_train" `
+  --output-dir "D:\PolypRuns\specialized_joint" `
   --folds 5 --seed 42 --size 352 `
-  --batch-size 2 --epochs 30 --patience 6 --device cuda
+  --batch-size 2 --epochs 30 --patience 6 --device cuda `
+  --no-overlays --joint-only
 ```
 
-The auxiliary roots must contain compatible binary segmentation masks. Convert
-other dataset formats to paired images/masks before running; the command fails
-on unpaired filenames rather than silently ignoring them. Joint training is
-not the same protocol as pretraining on all external datasets followed by a
-separate Kvasir fine-tune; the runner jointly samples auxiliary and Kvasir
-outer-training cases while keeping the Kvasir validation/test folds isolated.
+This is joint training, not sequential pretraining and fine-tuning. The 550
+ClinicDB cases are combined with each fold's Kvasir training cases; the
+ClinicDB, ColonDB, and ETIS test cases are never included in training or model
+selection. Run external evaluation only after checkpoints are complete:
+
+```powershell
+python -m polyp_pipeline external-evaluate `
+  --input-dir "D:\PolypRuns\specialized_joint" `
+  --external-test-dataset-root "D:\PolypDatasets\prepared\clinic_test" `
+  --external-test-dataset-root "D:\PolypDatasets\prepared\colon_test" `
+  --external-test-dataset-root "D:\PolypDatasets\prepared\etis_test" `
+  --batch-size 2 --device cuda
+```
+
+For comparison against the Kvasir-only architecture runs, evaluate those
+checkpoints separately by setting `--input-dir "runs\specialized_benchmark"`.
+External fold metrics are saved as `external_metrics.csv` and
+`external_summary.json`; combine the Kvasir-only and joint results with:
+
+```powershell
+python -m polyp_pipeline report `
+  --input-dir "runs\specialized_benchmark" `
+  --input-dir "D:\PolypRuns\specialized_joint" `
+  --output-dir "reports\external_joint"
+```
+
+Joint training is not the same protocol as pretraining on external datasets
+followed by separate Kvasir fine-tuning. The pipeline also excludes any
+auxiliary image that exactly matches the current outer-test image; that
+pixel-identical check does not guarantee discovery of resized or otherwise
+altered duplicates.
 
 ### DenseCRF and execution
 
@@ -391,12 +462,12 @@ python -m polyp_pipeline report `
 
 ### Completed Kvasir-only specialized results
 
-All five configurations completed five-fold cross-validation on the 1,000
-Kvasir-SEG cases. Values are mean +/- sample standard deviation across outer
-folds. The standard and TTA scores are paired evaluations of the same
-fold-specific checkpoint. No external dataset was available for joint
-training, and DenseCRF was not run because its optional Windows extension could
-not be built in this environment.
+The five Kvasir-only configurations completed five-fold cross-validation on
+the 1,000 Kvasir-SEG cases. Values are mean +/- sample standard deviation
+across outer folds. The standard and TTA scores are paired evaluations of the
+same fold-specific checkpoint. These rows are the Kvasir-only baseline for the
+separate joint-data experiment. DenseCRF was not run because its optional
+Windows extension could not be built in this environment.
 
 | Model / ablation | Dice | TTA Dice | mIoU | Sensitivity | Pixel specificity | AP50 | FPS | TTA FPS |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|

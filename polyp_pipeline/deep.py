@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import random
+import re
 import time
 from pathlib import Path
 
@@ -239,6 +240,8 @@ def _predict_outer_test(
     sessile_case_ids: set[str],
     test_time_augmentation: bool = False,
     dense_crf: bool = False,
+    fold_number: int | None = None,
+    write_predictions: bool = True,
 ) -> tuple[dict[str, float], list[dict[str, object]]]:
     model.eval()
     sum_counts = np.zeros(4, dtype=np.int64)
@@ -259,12 +262,15 @@ def _predict_outer_test(
     prediction_dir = output_dir / (
         "predictions_tta" if test_time_augmentation else "predictions"
     )
-    prediction_dir.mkdir(parents=True, exist_ok=True)
+    if write_predictions:
+        prediction_dir.mkdir(parents=True, exist_ok=True)
+    crf_prediction_dir: Path | None = None
     if dense_crf:
         from .refinement import dense_crf_refine
 
-        crf_prediction_dir = output_dir / "predictions_crf"
-        crf_prediction_dir.mkdir(parents=True, exist_ok=True)
+        if write_predictions:
+            crf_prediction_dir = output_dir / "predictions_crf"
+            crf_prediction_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.inference_mode():
         for images, masks, case_ids in loader:
@@ -325,10 +331,11 @@ def _predict_outer_test(
                             crf_probability, threshold
                         )
                     )
-                    cv2.imwrite(
-                        str(crf_prediction_dir / f"{case_id}.png"),
-                        (crf_probability * 255).clip(0, 255).astype(np.uint8),
-                    )
+                    if crf_prediction_dir is not None:
+                        cv2.imwrite(
+                            str(crf_prediction_dir / f"{case_id}.png"),
+                            (crf_probability * 255).clip(0, 255).astype(np.uint8),
+                        )
                 target_area_fraction = (
                     sum(
                         (box[2] - box[0]) * (box[3] - box[1])
@@ -339,7 +346,11 @@ def _predict_outer_test(
                 per_image_rows.append(
                     {
                         "case_id": case_id,
-                        "fold": int(output_dir.name.removeprefix("fold_")),
+                        "fold": (
+                            fold_number
+                            if fold_number is not None
+                            else int(output_dir.name.removeprefix("fold_"))
+                        ),
                         **metrics,
                         "target_box_count": len(target_boxes),
                         "target_box_area_fraction": target_area_fraction,
@@ -359,11 +370,12 @@ def _predict_outer_test(
                         probability, threshold
                     )
                 )
-                cv2.imwrite(
-                    str(prediction_dir / f"{case_id}.png"),
-                    (probability * 255).clip(0, 255).astype(np.uint8),
-                )
-                if write_overlays and not test_time_augmentation:
+                if write_predictions:
+                    cv2.imwrite(
+                        str(prediction_dir / f"{case_id}.png"),
+                        (probability * 255).clip(0, 255).astype(np.uint8),
+                    )
+                if write_predictions and write_overlays and not test_time_augmentation:
                     original = cv2.imread(str(case.image_path), cv2.IMREAD_COLOR)
                     original = cv2.resize(original, (size, size))
                     target_overlay = original.copy()
@@ -437,6 +449,269 @@ def _predict_outer_test(
             }
         )
     return result, per_image_rows
+
+
+def evaluate_external_sets(
+    experiment_dir: Path,
+    external_test_sets: dict[str, list[Case]],
+    batch_size: int = 2,
+    device_name: str = "cuda",
+    num_workers: int = 0,
+    dense_crf: bool = False,
+) -> list[dict[str, object]]:
+    if not external_test_sets:
+        raise ValueError("At least one external test dataset is required")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable.")
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name)
+        for name in external_test_sets
+    ):
+        raise ValueError("External dataset names may contain only letters, digits, _ and -")
+    all_case_ids: set[str] = set()
+    image_hashes: dict[str, tuple[str, str]] = {}
+    duplicate_pairs_by_dataset: dict[str, list[dict[str, str]]] = {
+        dataset_name: [] for dataset_name in external_test_sets
+    }
+    for dataset_name, cases in external_test_sets.items():
+        if not cases:
+            raise ValueError(f"External test dataset {dataset_name} contains no cases")
+        case_ids = {case.case_id for case in cases}
+        if len(case_ids) != len(cases) or all_case_ids & case_ids:
+            raise ValueError("External test case IDs must be unique across datasets")
+        all_case_ids.update(case_ids)
+        for case in cases:
+            digest = _image_content_hash(case)
+            if digest in image_hashes:
+                previous_dataset, previous_case = image_hashes[digest]
+                if previous_dataset == dataset_name:
+                    duplicate_pairs_by_dataset[dataset_name].append(
+                        {
+                            "first_case_id": previous_case,
+                            "duplicate_case_id": case.case_id,
+                        }
+                    )
+                    continue
+                raise ValueError(
+                    "External test datasets share an identical image: "
+                    f"{previous_case} and {case.case_id}"
+                )
+            image_hashes[digest] = (dataset_name, case.case_id)
+    if dense_crf:
+        from .refinement import dense_crf_refine
+
+        dense_crf_refine(
+            np.zeros((2, 2, 3), dtype=np.uint8),
+            np.full((2, 2), 0.5, dtype=np.float32),
+            iterations=1,
+        )
+
+    config_path = experiment_dir / "run_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Missing training configuration: {config_path}")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    model_name = str(config["model"])
+    preprocessing = str(config["preprocessing"])
+    image_size = int(config["image_size"])
+    threshold = float(config.get("threshold", 0.5))
+    folds = int(config["folds"])
+    pretrained_encoder = bool(config.get("pretrained_encoder", False))
+    use_tta = bool(config.get("test_time_augmentation", False))
+    run_config = {
+        "experiment": str(experiment_dir.resolve()),
+        "model": model_name,
+        "preprocessing": preprocessing,
+        "image_size": image_size,
+        "threshold": threshold,
+        "folds": folds,
+        "batch_size": batch_size,
+        "device": device_name,
+        "num_workers": num_workers,
+        "dense_crf": dense_crf,
+        "external_test_case_ids": {
+            name: sorted(case.case_id for case in cases)
+            for name, cases in sorted(external_test_sets.items())
+        },
+        "within_dataset_exact_image_duplicate_pairs": duplicate_pairs_by_dataset,
+    }
+    external_config_path = experiment_dir / "external_eval_config.json"
+    if external_config_path.is_file():
+        previous_config = json.loads(
+            external_config_path.read_text(encoding="utf-8")
+        )
+        if previous_config != run_config:
+            raise ValueError(
+                f"Cannot resume external evaluation in {experiment_dir}; "
+                "configuration or external test cases differ."
+            )
+    else:
+        _atomic_json_write(external_config_path, run_config)
+
+    metrics_path = experiment_dir / "external_metrics.csv"
+    results: list[dict[str, object]] = []
+    if metrics_path.is_file():
+        with metrics_path.open(newline="", encoding="utf-8") as file:
+            results = list(csv.DictReader(file))
+    completed = {
+        (str(row["dataset"]), int(row["fold"]))
+        for row in results
+        if row.get("dataset") and row.get("fold")
+    }
+    device = torch.device(device_name)
+    for fold_number in range(1, folds + 1):
+        fold_dir = experiment_dir / f"fold_{fold_number}"
+        checkpoint_path = fold_dir / "best_model.pt"
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Cannot evaluate external data before fold training completes: "
+                f"{checkpoint_path}"
+            )
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=True
+        )
+        if checkpoint.get("model_name") != model_name:
+            raise ValueError(f"Model name mismatch in {checkpoint_path}")
+        model = build_model(model_name, pretrained_encoder=False, image_size=image_size)
+        model.load_state_dict(checkpoint["model_state"])
+        model = model.to(device)
+        for dataset_name, cases in external_test_sets.items():
+            if (dataset_name, fold_number) in completed:
+                continue
+            loader = _make_loader(
+                cases,
+                image_size,
+                preprocessing,
+                batch_size,
+                shuffle=False,
+                workers=num_workers,
+                imagenet_normalize=pretrained_encoder,
+            )
+            evaluation_dir = (
+                fold_dir / "external_evaluation" / dataset_name
+            )
+            evaluation_dir.mkdir(parents=True, exist_ok=True)
+            metrics, per_image_rows = _predict_outer_test(
+                model,
+                cases,
+                loader,
+                device,
+                evaluation_dir,
+                threshold,
+                image_size,
+                False,
+                set(),
+                dense_crf=dense_crf,
+                fold_number=fold_number,
+                write_predictions=False,
+            )
+            tta_metrics: dict[str, float] = {}
+            tta_rows: list[dict[str, object]] = []
+            if use_tta:
+                tta_metrics, tta_rows = _predict_outer_test(
+                    model,
+                    cases,
+                    loader,
+                    device,
+                    evaluation_dir,
+                    threshold,
+                    image_size,
+                    False,
+                    set(),
+                    test_time_augmentation=True,
+                    fold_number=fold_number,
+                    write_predictions=False,
+                )
+            row: dict[str, object] = {
+                "experiment": experiment_dir.name,
+                "model": model_name,
+                "data_condition": (
+                    "joint_auxiliary"
+                    if config.get("auxiliary_case_ids")
+                    else "kvasir_only"
+                ),
+                "dataset": dataset_name,
+                "fold": fold_number,
+                "exact_image_duplicate_pairs": len(
+                    duplicate_pairs_by_dataset[dataset_name]
+                ),
+                "deep_supervision": int(bool(config.get("deep_supervision", False))),
+                "small_polyp_crop_probability": float(
+                    config.get("small_polyp_crop_probability", 0.0)
+                ),
+                "auxiliary_training_cases": len(
+                    config.get("auxiliary_case_ids", [])
+                ),
+                **metrics,
+                **{f"tta_{key}": value for key, value in tta_metrics.items()},
+            }
+            results.append(row)
+            results.sort(key=lambda result: (str(result["dataset"]), int(result["fold"])))
+            _write_csv_atomic(metrics_path, results)
+            for image_row in per_image_rows:
+                image_row.update(dataset=dataset_name, model=model_name)
+            _write_csv_atomic(
+                evaluation_dir / "per_image_metrics.csv", per_image_rows
+            )
+            if tta_rows:
+                for image_row in tta_rows:
+                    image_row.update(dataset=dataset_name, model=model_name)
+                _write_csv_atomic(
+                    evaluation_dir / "per_image_metrics_tta.csv", tta_rows
+                )
+            completed.add((dataset_name, fold_number))
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    metric_names = (
+        "dice",
+        "miou",
+        "sensitivity",
+        "specificity",
+        "ap50",
+        "box_precision",
+        "box_recall",
+        "inference_fps",
+        "tta_dice",
+        "tta_miou",
+        "tta_sensitivity",
+        "tta_specificity",
+        "tta_ap50",
+        "tta_box_precision",
+        "tta_box_recall",
+        "tta_inference_fps",
+        "crf_dice",
+        "crf_miou",
+        "crf_sensitivity",
+        "crf_specificity",
+        "crf_ap50",
+        "crf_box_precision",
+        "crf_box_recall",
+        "crf_inference_fps",
+    )
+    summaries: dict[str, dict[str, dict[str, float]]] = {}
+    for dataset_name in external_test_sets:
+        dataset_rows = [
+            row for row in results if row.get("dataset") == dataset_name
+        ]
+        if len(dataset_rows) != folds:
+            continue
+        summaries[dataset_name] = {}
+        for metric in metric_names:
+            values = [
+                float(row[metric])
+                for row in dataset_rows
+                if row.get(metric) not in (None, "")
+            ]
+            if values:
+                summaries[dataset_name][metric] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
+                }
+    _atomic_json_write(
+        experiment_dir / "external_metrics_summary.json", summaries
+    )
+    return results
 
 
 def train_cross_validation(

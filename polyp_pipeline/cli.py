@@ -8,7 +8,8 @@ from .advanced_benchmark import run_advanced_benchmark
 from .benchmark import read_benchmark_status, run_full_benchmark
 from .classical import run_classical_cv
 from .data import discover_cases
-from .deep import train_cross_validation
+from .dataset_prep import prepare_zenodo_datasets
+from .deep import evaluate_external_sets, train_cross_validation
 from .models import MODEL_SPECS
 from .report import generate_report
 from .specialized_benchmark import run_specialized_benchmark
@@ -70,7 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     report = commands.add_parser(
         "report", help="Combine completed experiments into a comparison table and chart."
     )
-    report.add_argument("--input-dir", type=Path, default=Path("runs"))
+    report.add_argument(
+        "--input-dir",
+        type=Path,
+        action="append",
+        help="Experiment directory to include; repeat to combine separate run roots.",
+    )
     report.add_argument("--output-dir", type=Path, default=Path("reports"))
 
     benchmark = commands.add_parser(
@@ -127,6 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional extra paired dataset with images/ and masks/; may be repeated.",
     )
     specialized.add_argument(
+        "--joint-only",
+        action="store_true",
+        help="Run only the auxiliary-data experiment cells; requires --aux-dataset-root.",
+    )
+    specialized.add_argument(
         "--output-dir",
         type=Path,
         default=Path("runs") / "specialized_benchmark",
@@ -151,6 +162,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     specialized.add_argument("--no-overlays", action="store_true")
 
+    external = commands.add_parser(
+        "external-evaluate",
+        help="Evaluate completed fold checkpoints on held-out paired datasets.",
+    )
+    external.add_argument(
+        "--input-dir",
+        type=Path,
+        default=Path("runs") / "specialized_benchmark",
+        help="Experiment directory or parent containing run_config.json files.",
+    )
+    external.add_argument(
+        "--external-test-dataset-root",
+        type=Path,
+        action="append",
+        required=True,
+        help="Paired images/ and masks/ dataset to hold out for evaluation; repeatable.",
+    )
+    external.add_argument("--batch-size", type=int, default=2)
+    external.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    external.add_argument("--num-workers", type=int, default=0)
+    external.add_argument("--dense-crf", action="store_true")
+
+    prepare = commands.add_parser(
+        "prepare-zenodo-datasets",
+        help="Verify and prepare the CVC/ETIS splits from Zenodo record 5579392.",
+    )
+    prepare.add_argument("--archive", type=Path, required=True)
+    prepare.add_argument(
+        "--kvasir-root",
+        type=Path,
+        default=Path("kvasir-seg") / "Kvasir-SEG",
+        help="Existing Kvasir-SEG root used to identify overlapping training cases.",
+    )
+    prepare.add_argument("--output-dir", type=Path, required=True)
+
     status = commands.add_parser(
         "status", help="Show completed, running, and pending benchmark experiments."
     )
@@ -161,10 +207,57 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     if args.command == "report":
-        print(generate_report(args.input_dir, args.output_dir))
+        print(generate_report(args.input_dir or Path("runs"), args.output_dir))
         return
     if args.command == "status":
         print(json.dumps(read_benchmark_status(args.input_dir), indent=2))
+        return
+    if args.command == "external-evaluate":
+        external_test_sets = {}
+        for index, dataset_root in enumerate(
+            args.external_test_dataset_root, start=1
+        ):
+            dataset_name = dataset_root.name.replace(" ", "_")
+            external_test_sets[dataset_name] = discover_cases(
+                dataset_root,
+                case_id_prefix=f"external{index}_{dataset_name}",
+            )
+        experiment_dirs = sorted(
+            {
+                path.parent
+                for path in args.input_dir.rglob("run_config.json")
+                if (path.parent / "fold_metrics.csv").is_file()
+            }
+        )
+        if args.input_dir.is_file() and args.input_dir.name == "run_config.json":
+            experiment_dirs = [args.input_dir.parent]
+        if not experiment_dirs:
+            raise FileNotFoundError(
+                f"No completed experiment configurations found under {args.input_dir}"
+            )
+        results = []
+        for experiment_dir in experiment_dirs:
+            results.extend(
+                evaluate_external_sets(
+                    experiment_dir,
+                    external_test_sets,
+                    batch_size=args.batch_size,
+                    device_name=args.device,
+                    num_workers=args.num_workers,
+                    dense_crf=args.dense_crf,
+                )
+            )
+        print(json.dumps({"evaluated_rows": len(results)}, indent=2))
+        return
+    if args.command == "prepare-zenodo-datasets":
+        print(
+            json.dumps(
+                prepare_zenodo_datasets(
+                    args.archive, args.kvasir_root, args.output_dir
+                ),
+                indent=2,
+            )
+        )
         return
     cases = discover_cases(args.dataset_root)
     print(f"Found {len(cases)} paired Kvasir-SEG images in {args.dataset_root}")
@@ -256,6 +349,7 @@ def main() -> None:
             sessile_case_ids=sessile_case_ids,
             dense_crf=args.dense_crf,
             overlays=not args.no_overlays,
+            joint_only=args.joint_only,
         )
         print(json.dumps(state, indent=2))
     else:

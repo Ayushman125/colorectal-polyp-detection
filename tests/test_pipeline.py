@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from zipfile import ZipFile
 
 import cv2
 import numpy as np
 
+import polyp_pipeline.dataset_prep as dataset_prep
 from polyp_pipeline.data import (
     Case,
     NonSingletonBatchSampler,
@@ -26,6 +29,113 @@ from unittest.mock import patch
 
 
 class DatasetTests(unittest.TestCase):
+    def test_preparation_records_within_split_and_rejects_cross_split_duplicates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "duplicate.zip"
+            image_bytes = cv2.imencode(
+                ".png", np.full((8, 8, 3), 30, dtype=np.uint8)
+            )[1].tobytes()
+            with ZipFile(archive_path, "w") as archive:
+                archive.writestr("train/image.png", image_bytes)
+                archive.writestr("test/image.png", image_bytes)
+            with ZipFile(archive_path) as archive:
+                train_member = archive.getinfo("train/image.png")
+                test_member = archive.getinfo("test/image.png")
+                duplicates = dataset_prep._validate_unique_images(
+                    archive,
+                    {
+                        "colon_test": {
+                            "first": (train_member, train_member),
+                            "second": (test_member, test_member),
+                        }
+                    },
+                )
+                self.assertEqual(len(duplicates), 1)
+                with self.assertRaisesRegex(ValueError, "Exact decoded image"):
+                    dataset_prep._validate_unique_images(
+                        archive,
+                        {
+                            "clinic_train": {"train": (train_member, train_member)},
+                            "clinic_test": {"test": (test_member, test_member)},
+                        },
+                    )
+
+    def test_zenodo_preparation_excludes_kvasir_and_extracts_held_out_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            archive_path = root / "synthetic.zip"
+            kvasir_root = root / "kvasir"
+            output_root = root / "prepared"
+            image = np.full((8, 8, 3), 20, dtype=np.uint8)
+            auxiliary_image = np.full((8, 8, 3), 40, dtype=np.uint8)
+            mask = np.zeros((8, 8), dtype=np.uint8)
+            mask[2:6, 2:6] = 255
+            image_bytes = cv2.imencode(".png", image)[1].tobytes()
+            auxiliary_image_bytes = cv2.imencode(".png", auxiliary_image)[1].tobytes()
+            mask_bytes = cv2.imencode(".png", mask)[1].tobytes()
+            with ZipFile(archive_path, "w") as archive:
+                for stem, encoded in (
+                    ("kvasir", image_bytes),
+                    ("auxiliary", auxiliary_image_bytes),
+                ):
+                    archive.writestr(f"NewTRimage/{stem}.png", encoded)
+                    archive.writestr(f"NewTRmask/{stem}.png", mask_bytes)
+                for index, dataset_name in enumerate(
+                    ("CVC-ClinicDB", "CVC-ColonDB", "ETIS-LaribPolypDB")
+                ):
+                    test_image = np.full((8, 8, 3), 100 + index, dtype=np.uint8)
+                    test_image_bytes = cv2.imencode(".png", test_image)[1].tobytes()
+                    archive.writestr(
+                        f"TestDataset/TestDataset/{dataset_name}/images/test.png",
+                        test_image_bytes,
+                    )
+                    archive.writestr(
+                        f"TestDataset/TestDataset/{dataset_name}/masks/test.png",
+                        mask_bytes,
+                    )
+            (kvasir_root / "images").mkdir(parents=True)
+            (kvasir_root / "masks").mkdir()
+            self.assertTrue(
+                cv2.imwrite(str(kvasir_root / "images" / "kvasir.jpg"), image)
+            )
+            self.assertTrue(
+                cv2.imwrite(str(kvasir_root / "masks" / "kvasir.png"), mask)
+            )
+            archive_md5 = hashlib.md5(
+                archive_path.read_bytes(), usedforsecurity=False
+            ).hexdigest()
+            with (
+                patch.object(dataset_prep, "ZENODO_ARCHIVE_MD5", archive_md5),
+                patch.object(dataset_prep, "EXPECTED_TRAIN_PAIRS", 2),
+                patch.object(dataset_prep, "EXPECTED_KVASIR_OVERLAP", 1),
+                patch.object(
+                    dataset_prep,
+                    "EXPECTED_EXTERNAL_COUNTS",
+                    {
+                        "clinic_test": 1,
+                        "colon_test": 1,
+                        "etis_test": 1,
+                    },
+                ),
+            ):
+                manifest = dataset_prep.prepare_zenodo_datasets(
+                    archive_path, kvasir_root, output_root
+                )
+                dataset_prep.prepare_zenodo_datasets(
+                    archive_path, kvasir_root, output_root
+                )
+
+            self.assertEqual(manifest["excluded_kvasir_overlap"], 1)
+            self.assertEqual(manifest["clinic_train_cases"], 1)
+            self.assertEqual(
+                [case.case_id for case in discover_cases(output_root / "clinic_train")],
+                ["auxiliary"],
+            )
+            for name in ("clinic_test", "colon_test", "etis_test"):
+                self.assertEqual(len(discover_cases(output_root / name)), 1)
+
     def test_pair_discovery_fails_on_unmatched_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -51,6 +161,25 @@ class DatasetTests(unittest.TestCase):
             )
             cases = discover_cases(root, case_id_prefix="clinic")
             self.assertEqual([case.case_id for case in cases], ["clinic__frame"])
+
+    def test_pair_discovery_supports_tiff_images_and_masks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "images").mkdir()
+            (root / "masks").mkdir()
+            self.assertTrue(
+                cv2.imwrite(
+                    str(root / "images" / "frame.tiff"),
+                    np.zeros((8, 8, 3), dtype=np.uint8),
+                )
+            )
+            self.assertTrue(
+                cv2.imwrite(
+                    str(root / "masks" / "frame.tiff"),
+                    np.zeros((8, 8), dtype=np.uint8),
+                )
+            )
+            self.assertEqual(len(discover_cases(root)), 1)
 
     def test_outer_folds_partition_cases_without_within_fold_overlap(self) -> None:
         cases = [
@@ -230,6 +359,15 @@ class FeatureAndMetricTests(unittest.TestCase):
         self.assertTrue(
             any(item["data_condition"] == "joint_auxiliary" for item in joint_plan)
         )
+        joint_only_plan = specialized_benchmark_plan(
+            use_auxiliary_data=True, joint_only=True
+        )
+        self.assertEqual(len(joint_only_plan), 2)
+        self.assertTrue(
+            all(item["data_condition"] == "joint_auxiliary" for item in joint_only_plan)
+        )
+        with self.assertRaisesRegex(ValueError, "requires at least one auxiliary dataset"):
+            specialized_benchmark_plan(use_auxiliary_data=False, joint_only=True)
 
     def test_report_combines_classical_fold_results(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -246,6 +384,50 @@ class FeatureAndMetricTests(unittest.TestCase):
             text = table.read_text(encoding="utf-8")
             self.assertIn("svm,clahe,not_applicable,2", text)
             self.assertIn("dice_mean", text)
+
+    def test_report_summarizes_external_test_fold_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run = root / "runs" / "deep" / "model"
+            run.mkdir(parents=True)
+            (run / "fold_metrics.csv").write_text(
+                "model,loss,preprocessing,fold,dice,miou,sensitivity,specificity\n"
+                "unet_resnet34,bce_dice,raw,1,0.7,0.6,0.8,0.95\n",
+                encoding="utf-8",
+            )
+            (run / "external_metrics.csv").write_text(
+                "experiment,model,data_condition,dataset,fold,deep_supervision,"
+                "small_polyp_crop_probability,auxiliary_training_cases,"
+                "exact_image_duplicate_pairs,dice,miou,sensitivity,specificity\n"
+                "model,unet_resnet34,joint_auxiliary,ETIS-Larib,1,1,0.5,550,2,"
+                "0.6,0.45,0.7,0.9\n",
+                encoding="utf-8",
+            )
+            other_run = root / "joint_runs" / "model2"
+            other_run.mkdir(parents=True)
+            (other_run / "fold_metrics.csv").write_text(
+                "model,loss,preprocessing,fold,dice,miou,sensitivity,specificity\n"
+                "unet_resnet34,bce_dice,raw,2,0.7,0.6,0.8,0.95\n",
+                encoding="utf-8",
+            )
+            (other_run / "external_metrics.csv").write_text(
+                "experiment,model,data_condition,dataset,fold,deep_supervision,"
+                "small_polyp_crop_probability,auxiliary_training_cases,"
+                "exact_image_duplicate_pairs,dice,miou,sensitivity,specificity\n"
+                "model2,unet_resnet34,joint_auxiliary,ETIS-Larib,2,1,0.5,550,2,"
+                "0.8,0.67,0.85,0.92\n",
+                encoding="utf-8",
+            )
+            generate_report(
+                [root / "runs", root / "joint_runs"], root / "reports"
+            )
+            comparison = (
+                root / "reports" / "external_test_comparison.csv"
+            ).read_text(encoding="utf-8")
+            self.assertIn("ETIS-Larib", comparison)
+            self.assertIn("exact_image_duplicate_pairs", comparison)
+            self.assertIn("ETIS-Larib,2,2,1", comparison)
+            self.assertIn("0.7,0.141421356", comparison)
 
     def test_report_summarizes_sessile_and_small_polyp_subgroups(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -402,6 +584,106 @@ class FeatureAndMetricTests(unittest.TestCase):
             self.assertIn('"event": "fold_resumed"', progress)
             self.assertTrue((output_dir / "summary.json").is_file())
             self.assertTrue((output_dir / "per_image_metrics_tta.csv").is_file())
+
+    def test_external_evaluation_loads_fold_checkpoints_and_persists_metrics(self) -> None:
+        import torch
+        from torch import nn
+
+        from polyp_pipeline.data import Case
+        from polyp_pipeline.deep import evaluate_external_sets
+
+        class TinySegmenter(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layer = nn.Conv2d(3, 1, kernel_size=1)
+
+            def forward(self, image: torch.Tensor) -> torch.Tensor:
+                return self.layer(image)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            experiment_dir = root / "experiment"
+            experiment_dir.mkdir()
+            config = {
+                "model": "unet_resnet34",
+                "preprocessing": "raw",
+                "image_size": 32,
+                "threshold": 0.5,
+                "folds": 2,
+                "pretrained_encoder": False,
+                "test_time_augmentation": False,
+                "auxiliary_case_ids": [],
+            }
+            (experiment_dir / "run_config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            state = TinySegmenter().state_dict()
+            for fold_number in (1, 2):
+                fold_dir = experiment_dir / f"fold_{fold_number}"
+                fold_dir.mkdir()
+                torch.save(
+                    {"model_name": config["model"], "model_state": state},
+                    fold_dir / "best_model.pt",
+                )
+            image_dir, mask_dir = root / "external_images", root / "external_masks"
+            image_dir.mkdir()
+            mask_dir.mkdir()
+            external_cases = []
+            for index in range(2):
+                image_path = image_dir / f"case_{index}.png"
+                mask_path = mask_dir / f"case_{index}.png"
+                self.assertTrue(
+                    cv2.imwrite(
+                        str(image_path),
+                        np.full((32, 32, 3), 80, dtype=np.uint8),
+                    )
+                )
+                mask = np.zeros((32, 32), dtype=np.uint8)
+                mask[8 + index : 24 + index, 8:24] = 255
+                self.assertTrue(cv2.imwrite(str(mask_path), mask))
+                external_cases.append(
+                    Case(f"external__case_{index}", image_path, mask_path)
+                )
+            with patch(
+                "polyp_pipeline.deep.build_model",
+                side_effect=lambda *args, **kwargs: TinySegmenter(),
+            ):
+                results = evaluate_external_sets(
+                    experiment_dir,
+                    {"ETIS-Larib": external_cases},
+                    batch_size=2,
+                    device_name="cpu",
+                )
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(row["dataset"] == "ETIS-Larib" for row in results))
+            self.assertTrue(all("dice" in row for row in results))
+            self.assertTrue((experiment_dir / "external_metrics.csv").is_file())
+            self.assertTrue(
+                (experiment_dir / "external_metrics_summary.json").is_file()
+            )
+            external_config = json.loads(
+                (experiment_dir / "external_eval_config.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                len(
+                    external_config["within_dataset_exact_image_duplicate_pairs"][
+                        "ETIS-Larib"
+                    ]
+                ),
+                1,
+            )
+            with self.assertRaisesRegex(ValueError, "share an identical image"):
+                evaluate_external_sets(
+                    experiment_dir,
+                    {
+                        "dataset_a": [external_cases[0]],
+                        "dataset_b": [external_cases[1]],
+                    },
+                    batch_size=2,
+                    device_name="cpu",
+                )
 
     def test_auxiliary_exact_test_duplicate_is_excluded_from_training(self) -> None:
         import torch

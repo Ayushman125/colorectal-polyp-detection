@@ -39,54 +39,86 @@ METRICS = (
     "crf_inference_fps",
 )
 
+EXTERNAL_METRICS = (
+    "dice",
+    "miou",
+    "sensitivity",
+    "specificity",
+    "ap50",
+    "box_precision",
+    "box_recall",
+    "inference_fps",
+    "tta_dice",
+    "tta_miou",
+    "tta_sensitivity",
+    "tta_specificity",
+    "tta_ap50",
+    "tta_box_precision",
+    "tta_box_recall",
+    "tta_inference_fps",
+    "crf_dice",
+    "crf_miou",
+    "crf_sensitivity",
+    "crf_specificity",
+    "crf_ap50",
+    "crf_box_precision",
+    "crf_box_recall",
+    "crf_inference_fps",
+)
 
-def _read_result_rows(root: Path) -> list[dict[str, Any]]:
+
+def _input_roots(input_dirs: Path | list[Path]) -> list[Path]:
+    return [input_dirs] if isinstance(input_dirs, Path) else input_dirs
+
+
+def _read_result_rows(input_dirs: Path | list[Path]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for path in root.rglob("fold_metrics.csv"):
-        with path.open(newline="", encoding="utf-8") as file:
-            for source_row in csv.DictReader(file):
-                row = dict(source_row)
-                rows.append(row)
-                if row.get("tta_dice") not in (None, ""):
-                    tta_row = {
-                        key: value
-                        for key, value in row.items()
-                        if not key.startswith(("tta_", "crf_"))
-                    }
-                    tta_row["model"] = f"{row['model']}_tta"
-                    for metric in (
-                        "dice",
-                        "miou",
-                        "sensitivity",
-                        "specificity",
-                        "ap50",
-                        "box_precision",
-                        "box_recall",
-                        "inference_fps",
-                    ):
-                        tta_row[metric] = row.get(f"tta_{metric}", "")
-                    rows.append(tta_row)
-                if row.get("crf_dice") not in (None, ""):
-                    crf_row = {
-                        key: value
-                        for key, value in row.items()
-                        if not key.startswith(("crf_", "tta_"))
-                    }
-                    crf_row["model"] = f"{row['model']}_crf"
-                    for metric in (
-                        "dice",
-                        "miou",
-                        "sensitivity",
-                        "specificity",
-                        "ap50",
-                        "box_precision",
-                        "box_recall",
-                        "inference_fps",
-                    ):
-                        crf_row[metric] = row.get(f"crf_{metric}", "")
-                    rows.append(crf_row)
-    for path in root.rglob("classical_metrics.json"):
-        rows.extend(json.loads(path.read_text(encoding="utf-8")))
+    for root in _input_roots(input_dirs):
+        for path in root.rglob("fold_metrics.csv"):
+            with path.open(newline="", encoding="utf-8") as file:
+                for source_row in csv.DictReader(file):
+                    row = dict(source_row)
+                    rows.append(row)
+                    if row.get("tta_dice") not in (None, ""):
+                        tta_row = {
+                            key: value
+                            for key, value in row.items()
+                            if not key.startswith(("tta_", "crf_"))
+                        }
+                        tta_row["model"] = f"{row['model']}_tta"
+                        for metric in (
+                            "dice",
+                            "miou",
+                            "sensitivity",
+                            "specificity",
+                            "ap50",
+                            "box_precision",
+                            "box_recall",
+                            "inference_fps",
+                        ):
+                            tta_row[metric] = row.get(f"tta_{metric}", "")
+                        rows.append(tta_row)
+                    if row.get("crf_dice") not in (None, ""):
+                        crf_row = {
+                            key: value
+                            for key, value in row.items()
+                            if not key.startswith(("crf_", "tta_"))
+                        }
+                        crf_row["model"] = f"{row['model']}_crf"
+                        for metric in (
+                            "dice",
+                            "miou",
+                            "sensitivity",
+                            "specificity",
+                            "ap50",
+                            "box_precision",
+                            "box_recall",
+                            "inference_fps",
+                        ):
+                            crf_row[metric] = row.get(f"crf_{metric}", "")
+                        rows.append(crf_row)
+        for path in root.rglob("classical_metrics.json"):
+            rows.extend(json.loads(path.read_text(encoding="utf-8")))
     if not rows:
         raise FileNotFoundError(
             f"No fold_metrics.csv or classical_metrics.json found under {root}"
@@ -94,7 +126,76 @@ def _read_result_rows(root: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def generate_report(input_dir: Path, output_dir: Path) -> Path:
+def _write_external_report(
+    input_dirs: Path | list[Path], output_dir: Path
+) -> None:
+    rows: list[dict[str, str]] = []
+    for root in _input_roots(input_dirs):
+        for path in root.rglob("external_metrics.csv"):
+            with path.open(newline="", encoding="utf-8") as file:
+                rows.extend(csv.DictReader(file))
+    if not rows:
+        return
+
+    grouped: dict[
+        tuple[str, str, str, str, str, str], list[dict[str, str]]
+    ] = defaultdict(list)
+    for row in rows:
+        key = (
+            row.get("model", "unknown"),
+            row.get("data_condition", "unknown"),
+            row.get("dataset", "unknown"),
+            row.get("deep_supervision", "0"),
+            row.get("small_polyp_crop_probability", "0"),
+            row.get("auxiliary_training_cases", "0"),
+        )
+        grouped[key].append(row)
+
+    records: list[dict[str, Any]] = []
+    for (
+        model,
+        data_condition,
+        dataset,
+        deep_supervision,
+        crop_probability,
+        auxiliary_count,
+    ), group in sorted(grouped.items()):
+        record: dict[str, Any] = {
+            "model": model,
+            "data_condition": data_condition,
+            "dataset": dataset,
+            "folds": len(group),
+            "exact_image_duplicate_pairs": max(
+                (int(row.get("exact_image_duplicate_pairs", 0)) for row in group),
+                default=0,
+            ),
+            "deep_supervision": deep_supervision,
+            "small_polyp_crop_probability": crop_probability,
+            "auxiliary_training_cases": auxiliary_count,
+        }
+        for metric in EXTERNAL_METRICS:
+            values = []
+            for row in group:
+                try:
+                    value = float(row[metric])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if value == value:
+                    values.append(value)
+            record[f"{metric}_mean"] = mean(values) if values else ""
+            record[f"{metric}_std"] = (
+                stdev(values) if len(values) > 1 else (0.0 if values else "")
+            )
+        records.append(record)
+
+    report_path = output_dir / "external_test_comparison.csv"
+    with report_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(records[0]))
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
     rows = _read_result_rows(input_dir)
     grouped: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -142,8 +243,10 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
         writer.writerows(report_rows)
 
     subgroup_rows: list[dict[str, Any]] = []
-    per_image_paths = list(input_dir.rglob("per_image_metrics.csv"))
-    per_image_paths.extend(input_dir.rglob("per_image_metrics_tta.csv"))
+    per_image_paths = []
+    for root in _input_roots(input_dir):
+        per_image_paths.extend(root.rglob("per_image_metrics.csv"))
+        per_image_paths.extend(root.rglob("per_image_metrics_tta.csv"))
     for path in per_image_paths:
         is_tta = path.name == "per_image_metrics_tta.csv"
         config_path = path.parent / "run_config.json"
@@ -235,6 +338,8 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
             writer = csv.DictWriter(file, fieldnames=list(subgroup_rows[0]))
             writer.writeheader()
             writer.writerows(subgroup_rows)
+
+    _write_external_report(input_dir, output_dir)
 
     deep_groups = [
         row
