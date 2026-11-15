@@ -389,6 +389,60 @@ python -m polyp_pipeline report `
   --output-dir "reports\specialized_benchmark"
 ```
 
+### Completed Kvasir-only specialized results
+
+All five configurations completed five-fold cross-validation on the 1,000
+Kvasir-SEG cases. Values are mean +/- sample standard deviation across outer
+folds. The standard and TTA scores are paired evaluations of the same
+fold-specific checkpoint. No external dataset was available for joint
+training, and DenseCRF was not run because its optional Windows extension could
+not be built in this environment.
+
+| Model / ablation | Dice | TTA Dice | mIoU | Sensitivity | Pixel specificity | AP50 | FPS | TTA FPS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PraNet-style, no deep supervision, no crop | 0.869 +/- 0.004 | 0.883 +/- 0.011 | 0.801 +/- 0.007 | **0.885 +/- 0.024** | 0.976 +/- 0.003 | 0.850 +/- 0.015 | 49.6 +/- 0.8 | 20.5 +/- 0.1 |
+| PraNet-style, deep supervision, no crop | 0.865 +/- 0.013 | 0.879 +/- 0.010 | 0.794 +/- 0.016 | 0.863 +/- 0.018 | 0.978 +/- 0.003 | 0.834 +/- 0.023 | 48.7 +/- 0.4 | 20.5 +/- 0.2 |
+| PraNet-style, deep supervision, 50% small-lesion crop | 0.867 +/- 0.017 | 0.877 +/- 0.018 | 0.796 +/- 0.022 | 0.856 +/- 0.037 | 0.982 +/- 0.006 | 0.851 +/- 0.025 | 48.7 +/- 1.4 | 20.2 +/- 0.3 |
+| TransFuse-style, no deep supervision, no crop | 0.879 +/- 0.018 | 0.888 +/- 0.018 | 0.812 +/- 0.021 | 0.862 +/- 0.031 | **0.986 +/- 0.004** | 0.864 +/- 0.032 | 28.1 +/- 0.6 | 7.4 +/- 0.1 |
+| TransFuse-style, deep supervision, 50% small-lesion crop | **0.884 +/- 0.017** | **0.892 +/- 0.016** | **0.819 +/- 0.020** | 0.871 +/- 0.010 | 0.985 +/- 0.003 | **0.873 +/- 0.035** | 28.3 +/- 0.3 | 7.4 +/- 0.1 |
+
+The specialized models did not reach the 0.93-0.95 target. The best
+specialized result was TransFuse-style with deep supervision and cropping:
+Dice 0.884 ordinary and 0.892 with TTA. This remains below the previously
+measured pretrained FPN BCE+Dice with TTA (0.895); these experiments did not
+establish a new best score.
+
+The PraNet-style ablations do not show a gain from deep supervision in this
+setup: adding it without cropping changed Dice from 0.869 to 0.865 and
+sensitivity from 0.885 to 0.863. Adding crops to that deep-supervision run
+raised Dice slightly from 0.865 to 0.867, but remained below the no-auxiliary
+baseline. For TransFuse-style, deep supervision and cropping together raised
+Dice from 0.879 to 0.884 and sensitivity from 0.862 to 0.871. Since both
+interventions changed together in that comparison, their individual effects
+cannot be separated.
+
+Four-view TTA increased Dice in all five configurations; the mean paired
+improvement was about 0.011. It reduced measured throughput substantially:
+from about 49 FPS to 20 FPS for PraNet-style and 28 FPS to 7 FPS for
+TransFuse-style. The TransFuse-style TTA score was still below the earlier FPN
+TTA result, and the latency cost is significant.
+
+Small-box results remain uncertain because only 13 cases meet the <=2% target
+bounding-box area subgroup criterion. For example, the best specialized TTA
+small-box Dice was 0.735 for TransFuse-style without the two training
+interventions; with deep supervision and cropping it was 0.639. Sessile
+subset results are likewise descriptive on 196 overlapping Kvasir-SEG images,
+not an external cohort. These data do not show reliable small/flat-lesion
+performance gains. Specificity remains pixel-level on polyp-positive frames,
+not clinical specificity on normal patients. Fold SDs are descriptive; no
+significance tests or confidence intervals were computed.
+
+The final tables and plot are committed under
+[reports/specialized_benchmark](reports/specialized_benchmark/):
+[benchmark_comparison.csv](reports/specialized_benchmark/benchmark_comparison.csv),
+[subgroup_comparison.csv](reports/specialized_benchmark/subgroup_comparison.csv),
+and [ablation_and_model_comparison.png](reports/specialized_benchmark/ablation_and_model_comparison.png).
+
 The target Dice range of 0.93-0.95 is an experimental goal, not a guaranteed
 outcome. Report only completed held-out results; do not tune architecture,
 thresholds, or CRF parameters against outer-test metrics.

@@ -247,14 +247,30 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        labels = [
-            f"{row['model']}\n{row['preprocessing']} / {row['loss']}\n"
-            f"DS={row['deep_supervision']} crop={row['small_polyp_crop_probability']} "
-            f"aux={row['auxiliary_training_cases']}"
-            for row in deep_groups
-        ]
+        short_names = {
+            "pranet_resnet34": "PraNet / R34",
+            "transfuse_resnet34_swin_tiny": "TransFuse / Swin-T",
+            "deeplabv3plus_resnet34": "DeepLabV3+ / R34",
+            "segformer_mit_b0": "SegFormer / MiT-B0",
+            "upernet_mit_b0": "UPerNet / MiT-B0",
+        }
+        labels = []
+        for row in deep_groups:
+            model_name = str(row["model"])
+            suffix = ""
+            for ending, label in (("_tta", " + TTA"), ("_crf", " + CRF")):
+                if model_name.endswith(ending):
+                    model_name = model_name[: -len(ending)]
+                    suffix = label
+                    break
+            labels.append(
+                f"{short_names.get(model_name, model_name)}{suffix}\n"
+                f"{row['preprocessing']} / {row['loss']}\n"
+                f"DS={row['deep_supervision']} crop="
+                f"{row['small_polyp_crop_probability']}"
+            )
         x_positions = list(range(len(labels)))
-        figure, axes = plt.subplots(1, 2, figsize=(max(12, len(labels) * 1.25), 5))
+        figure, axes = plt.subplots(1, 2, figsize=(max(12, len(labels) * 1.8), 6))
         for axis, metric, title in (
             (axes[0], "dice", "Out-of-fold Dice"),
             (axes[1], "sensitivity", "Out-of-fold sensitivity"),
@@ -262,7 +278,7 @@ def generate_report(input_dir: Path, output_dir: Path) -> Path:
             means = [float(row[f"{metric}_mean"]) for row in deep_groups]
             deviations = [float(row[f"{metric}_std"]) for row in deep_groups]
             axis.bar(x_positions, means, yerr=deviations, capsize=3)
-            axis.set_xticks(x_positions, labels, rotation=45, ha="right")
+            axis.set_xticks(x_positions, labels, rotation=35, ha="right", fontsize=8)
             axis.set_ylim(0, 1)
             axis.set_ylabel("Mean across outer folds")
             axis.set_title(title)
