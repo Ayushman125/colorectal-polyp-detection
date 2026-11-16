@@ -515,6 +515,69 @@ The final tables and plot are committed under
 [subgroup_comparison.csv](reports/specialized_benchmark/subgroup_comparison.csv),
 and [ablation_and_model_comparison.png](reports/specialized_benchmark/ablation_and_model_comparison.png).
 
+### Joint training and held-out external results
+
+Both joint-data configurations completed five-fold training: PraNet-style
+ResNet-34 and TransFuse-style ResNet-34/Swin-Tiny, each with deep supervision
+and 50% small-lesion crop sampling. Every fold trained with the 550 auxiliary
+ClinicDB cases plus its Kvasir training portion. The 62-case ClinicDB,
+380-case ColonDB, and 196-case ETIS test splits were held out for evaluation.
+The Kvasir-only comparison uses the same architecture and ablation settings
+without auxiliary training data. Values are mean +/- sample standard
+deviation across the five fold-specific checkpoints; the same external cases
+are scored by each checkpoint, so fold SD describes model variation, not
+uncertainty from five independent external cohorts.
+
+| External set (cases; exact-image duplicate pairs) | Model | Kvasir-only Dice | Joint Dice | Joint TTA Dice |
+|---|---|---:|---:|---:|
+| ClinicDB (62; 0) | PraNet-style | 0.728 +/- 0.034 | 0.840 +/- 0.033 | **0.854 +/- 0.026** |
+| ClinicDB (62; 0) | TransFuse-style | 0.738 +/- 0.017 | **0.854 +/- 0.029** | 0.852 +/- 0.033 |
+| ColonDB (380; 34) | PraNet-style | 0.596 +/- 0.035 | 0.688 +/- 0.033 | 0.703 +/- 0.014 |
+| ColonDB (380; 34) | TransFuse-style | 0.664 +/- 0.028 | 0.713 +/- 0.039 | **0.719 +/- 0.029** |
+| ETIS (196; 3) | PraNet-style | 0.473 +/- 0.054 | 0.623 +/- 0.011 | **0.645 +/- 0.018** |
+| ETIS (196; 3) | TransFuse-style | 0.578 +/- 0.051 | 0.623 +/- 0.052 | 0.638 +/- 0.065 |
+
+Joint training raised ordinary Dice against the matched Kvasir-only model in
+all six architecture/dataset comparisons, by 0.044 to 0.151. This is a
+descriptive result, not a significance test. TTA raised joint Dice in five of
+six comparisons; TransFuse-style ClinicDB Dice decreased slightly from 0.854
+to 0.852. Best joint TTA Dice was 0.854 on ClinicDB, 0.719 on ColonDB, and
+0.645 on ETIS. All remain below the 0.93-0.95 research target, and the
+ColonDB/ETIS results show a substantial cross-dataset performance drop.
+
+On Kvasir outer-fold evaluation, joint PraNet-style Dice was
+0.881 +/- 0.012 (TTA 0.889 +/- 0.007); joint TransFuse-style Dice was
+0.884 +/- 0.015 (TTA 0.890 +/- 0.012). Joint training did not surpass the
+previous pretrained FPN BCE+Dice Kvasir TTA result of 0.895.
+
+The external report includes mIoU, sensitivity, pixel specificity, AP50,
+bounding-box precision/recall, ordinary and TTA throughput, and fold standard
+deviations. For example, joint TTA sensitivity/AP50 were 0.879/0.882 for
+PraNet-style on ClinicDB, 0.576/0.697 for TransFuse-style on ColonDB, and
+0.840/0.604 for PraNet-style on ETIS. Pixel specificity is computed on
+polyp-positive frames and must not be interpreted as clinical specificity on
+normal patients. TTA is a four-view accuracy/latency tradeoff; measured TTA
+throughput was about 22 FPS for PraNet-style and 8 FPS for TransFuse-style.
+
+The archive's test data contain 34 exact-image duplicate pairs in ColonDB and
+3 in ETIS; these cases are retained and counted rather than removed. Four
+ColonDB pairs and all three ETIS pairs have different masks, so repeated
+images are not independent observations and can reflect annotation
+differences. The report exposes duplicate-pair counts for interpretation.
+There are no confidence intervals or significance tests, and these results
+are not clinical validation.
+
+The combined report is in
+[reports/external_joint](reports/external_joint/):
+[external_test_comparison.csv](reports/external_joint/external_test_comparison.csv)
+contains the full external metric comparison,
+[benchmark_comparison.csv](reports/external_joint/benchmark_comparison.csv)
+contains Kvasir fold results, and
+[subgroup_comparison.csv](reports/external_joint/subgroup_comparison.csv)
+contains sessile/small-box subgroup results. The plots are in
+[ablation_and_model_comparison.png](reports/external_joint/ablation_and_model_comparison.png).
+Datasets and checkpoints remain outside the repository.
+
 The target Dice range of 0.93-0.95 is an experimental goal, not a guaranteed
 outcome. Report only completed held-out results; do not tune architecture,
 thresholds, or CRF parameters against outer-test metrics.
