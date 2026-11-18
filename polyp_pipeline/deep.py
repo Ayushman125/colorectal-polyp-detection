@@ -6,10 +6,12 @@ import datetime as dt
 import hashlib
 import json
 import os
+import pickle
 import platform
 import random
 import re
 import time
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -47,6 +49,47 @@ def _final_logits(
     outputs: torch.Tensor | tuple[torch.Tensor, ...]
 ) -> torch.Tensor:
     return outputs if isinstance(outputs, torch.Tensor) else outputs[0]
+
+
+def _photometric_view(images: torch.Tensor, strength: float) -> torch.Tensor:
+    batch_size, channels = images.shape[:2]
+    contrast = 1.0 + torch.randn(
+        (batch_size, 1, 1, 1), device=images.device, dtype=images.dtype
+    ) * strength
+    brightness = torch.randn(
+        (batch_size, channels, 1, 1), device=images.device, dtype=images.dtype
+    ) * strength
+    return (images * contrast + brightness).clamp(-5.0, 5.0)
+
+
+def _confidence_consistency_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    confidence_threshold: float = 0.7,
+) -> torch.Tensor:
+    teacher_probabilities = torch.sigmoid(teacher_logits.float()).detach()
+    student_probabilities = torch.sigmoid(student_logits.float())
+    confidence = (
+        (teacher_probabilities >= confidence_threshold)
+        | (teacher_probabilities <= 1.0 - confidence_threshold)
+    ).to(dtype=student_probabilities.dtype)
+    squared_error = (student_probabilities - teacher_probabilities).square()
+    return (squared_error * confidence).sum() / confidence.sum().clamp_min(1.0)
+
+
+@torch.no_grad()
+def _update_ema_model(
+    teacher: torch.nn.Module, student: torch.nn.Module, decay: float
+) -> None:
+    for teacher_parameter, student_parameter in zip(
+        teacher.parameters(), student.parameters()
+    ):
+        teacher_parameter.lerp_(student_parameter, 1.0 - decay)
+    for teacher_buffer, student_buffer in zip(teacher.buffers(), student.buffers()):
+        if torch.is_floating_point(teacher_buffer):
+            teacher_buffer.lerp_(student_buffer, 1.0 - decay)
+        else:
+            teacher_buffer.copy_(student_buffer)
 
 
 def _image_content_hash(case: Case) -> str:
@@ -740,6 +783,10 @@ def train_cross_validation(
     small_polyp_crop_probability: float = 0.0,
     auxiliary_cases: list[Case] | None = None,
     dense_crf: bool = False,
+    consistency_weight: float = 0.0,
+    ema_decay: float = 0.99,
+    consistency_rampup_epochs: int = 5,
+    write_predictions: bool = True,
 ) -> list[dict[str, float | int | str]]:
     if model_name not in MODEL_SPECS:
         raise ValueError(f"Unsupported model: {model_name}")
@@ -749,6 +796,12 @@ def train_cross_validation(
         )
     if not 0.0 <= small_polyp_crop_probability <= 1.0:
         raise ValueError("small_polyp_crop_probability must be between 0 and 1")
+    if not np.isfinite(consistency_weight) or consistency_weight < 0:
+        raise ValueError("consistency_weight must be finite and non-negative")
+    if not 0.0 <= ema_decay < 1.0:
+        raise ValueError("ema_decay must be in [0, 1)")
+    if consistency_rampup_epochs < 1:
+        raise ValueError("consistency_rampup_epochs must be positive")
     auxiliary_cases = auxiliary_cases or []
     auxiliary_ids = [case.case_id for case in auxiliary_cases]
     if len(auxiliary_ids) != len(set(auxiliary_ids)):
@@ -806,6 +859,18 @@ def train_cross_validation(
     }
     if test_time_augmentation:
         run_config["test_time_augmentation"] = True
+    if loss_name == "bce_dice_boundary":
+        run_config["boundary_weight"] = 0.1
+    if consistency_weight > 0.0:
+        run_config.update(
+            consistency_weight=consistency_weight,
+            ema_decay=ema_decay,
+            consistency_rampup_epochs=consistency_rampup_epochs,
+            consistency_confidence_threshold=0.7,
+            consistency_view_strengths=[0.025, 0.1],
+        )
+    if not write_predictions:
+        run_config["write_predictions"] = False
     try:
         import segmentation_models_pytorch as smp
 
@@ -938,6 +1003,10 @@ def train_cross_validation(
         model = build_model(model_name, pretrained_encoder, image_size=image_size)
         parameters_m, gflops_per_image = _model_complexity(model, image_size)
         model = model.to(device)
+        ema_model: torch.nn.Module | None = None
+        if consistency_weight > 0.0:
+            ema_model = copy.deepcopy(model).eval()
+            ema_model.requires_grad_(False)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="max", factor=0.5, patience=2
@@ -952,46 +1021,134 @@ def train_cross_validation(
         latest_checkpoint_path = fold_dir / "latest_training.pt"
         start_epoch = 0
         if latest_checkpoint_path.is_file():
-            checkpoint = torch.load(
-                latest_checkpoint_path, map_location="cpu", weights_only=False
-            )
-            if checkpoint["model_name"] != model_name or checkpoint["loss_name"] != loss_name:
-                raise ValueError(f"Checkpoint configuration mismatch at {latest_checkpoint_path}")
-            model.load_state_dict(checkpoint["model_state"])
-            optimizer.load_state_dict(checkpoint["optimizer_state"])
-            scheduler.load_state_dict(checkpoint["scheduler_state"])
-            scaler.load_state_dict(checkpoint["scaler_state"])
-            start_epoch = int(checkpoint["completed_epoch"])
-            best_dice = float(checkpoint["best_validation_dice"])
-            epochs_without_improvement = int(
-                checkpoint["epochs_without_improvement"]
-            )
-            previous_max_epochs = int(checkpoint.get("max_epochs", epochs))
-            if epochs > previous_max_epochs:
-                epochs_without_improvement = 0
+            try:
+                checkpoint = torch.load(
+                    latest_checkpoint_path, map_location="cpu", weights_only=False
+                )
+            except (
+                RuntimeError,
+                EOFError,
+                pickle.UnpicklingError,
+                zipfile.BadZipFile,
+            ) as error:
+                if not checkpoint_path.is_file():
+                    raise RuntimeError(
+                        f"Latest training checkpoint is unreadable and no valid "
+                        f"best-model checkpoint exists for {model_name} fold "
+                        f"{fold_number} at {fold_dir}"
+                    ) from error
+                fallback_checkpoint = torch.load(
+                    checkpoint_path, map_location="cpu", weights_only=True
+                )
+                if (
+                    fallback_checkpoint.get("model_name") != model_name
+                    or fallback_checkpoint.get("loss_name") != loss_name
+                ):
+                    raise ValueError(
+                        f"Best-model checkpoint configuration mismatch at "
+                        f"{checkpoint_path}"
+                    ) from error
+                history_path = fold_dir / "training_history.json"
+                if not history_path.is_file():
+                    raise RuntimeError(
+                        f"Cannot recover training progress without {history_path}"
+                    ) from error
+                recovered_history = json.loads(
+                    history_path.read_text(encoding="utf-8")
+                )
+                if not recovered_history:
+                    raise RuntimeError(
+                        f"Cannot recover training progress from empty {history_path}"
+                    ) from error
+                history = recovered_history
+                start_epoch = int(history[-1]["epoch"])
+                if start_epoch < 1 or start_epoch > epochs:
+                    raise RuntimeError(
+                        f"Invalid recovered epoch {start_epoch} in {history_path}"
+                    ) from error
+                best_dice = float(fallback_checkpoint["best_validation_dice"])
+                best_model_state = fallback_checkpoint["model_state"]
+                model.load_state_dict(best_model_state)
+                if ema_model is not None:
+                    ema_model.load_state_dict(best_model_state)
+                best_epoch = next(
+                    (
+                        int(record["epoch"])
+                        for record in history
+                        if float(record["validation_dice"]) >= best_dice
+                    ),
+                    start_epoch,
+                )
+                epochs_without_improvement = start_epoch - best_epoch
+                print(
+                    f"Recovering {model_name} fold {fold_number} from its "
+                    f"best-validation weights at epoch {start_epoch}; optimizer "
+                    "and random-number state will be reinitialized."
+                )
                 _log_progress(
                     progress_log,
-                    "fold_extended",
+                    "checkpoint_recovered_from_best_model",
                     model=model_name,
                     fold=fold_number,
-                    previous_max_epochs=previous_max_epochs,
-                    new_max_epochs=epochs,
+                    completed_epoch=start_epoch,
+                    best_validation_dice=best_dice,
+                    optimizer_state_restored=False,
+                    checkpoint_error=str(error),
                 )
-            history = checkpoint["history"]
-            best_model_state = checkpoint["best_model_state"]
-            _restore_rng_state(checkpoint["rng_state"])
-            print(
-                f"Resuming {model_name} fold {fold_number} at "
-                f"epoch {start_epoch + 1}/{epochs}"
-            )
-            _log_progress(
-                progress_log,
-                "fold_resumed",
-                model=model_name,
-                fold=fold_number,
-                completed_epoch=start_epoch,
-                max_epochs=epochs,
-            )
+                _log_progress(
+                    progress_log,
+                    "fold_resumed",
+                    model=model_name,
+                    fold=fold_number,
+                    completed_epoch=start_epoch,
+                    max_epochs=epochs,
+                    recovered_from_best_model=True,
+                )
+            else:
+                if checkpoint["model_name"] != model_name or checkpoint["loss_name"] != loss_name:
+                    raise ValueError(f"Checkpoint configuration mismatch at {latest_checkpoint_path}")
+                model.load_state_dict(checkpoint["model_state"])
+                if ema_model is not None:
+                    teacher_state = checkpoint.get("ema_model_state")
+                    if teacher_state is None:
+                        raise ValueError(
+                            f"EMA teacher state is missing from {latest_checkpoint_path}"
+                        )
+                    ema_model.load_state_dict(teacher_state)
+                optimizer.load_state_dict(checkpoint["optimizer_state"])
+                scheduler.load_state_dict(checkpoint["scheduler_state"])
+                scaler.load_state_dict(checkpoint["scaler_state"])
+                start_epoch = int(checkpoint["completed_epoch"])
+                best_dice = float(checkpoint["best_validation_dice"])
+                epochs_without_improvement = int(
+                    checkpoint["epochs_without_improvement"]
+                )
+                previous_max_epochs = int(checkpoint.get("max_epochs", epochs))
+                if epochs > previous_max_epochs:
+                    epochs_without_improvement = 0
+                    _log_progress(
+                        progress_log,
+                        "fold_extended",
+                        model=model_name,
+                        fold=fold_number,
+                        previous_max_epochs=previous_max_epochs,
+                        new_max_epochs=epochs,
+                    )
+                history = checkpoint["history"]
+                best_model_state = checkpoint["best_model_state"]
+                _restore_rng_state(checkpoint["rng_state"])
+                print(
+                    f"Resuming {model_name} fold {fold_number} at "
+                    f"epoch {start_epoch + 1}/{epochs}"
+                )
+                _log_progress(
+                    progress_log,
+                    "fold_resumed",
+                    model=model_name,
+                    fold=fold_number,
+                    completed_epoch=start_epoch,
+                    max_epochs=epochs,
+                )
         else:
             _log_progress(
                 progress_log,
@@ -1006,27 +1163,68 @@ def train_cross_validation(
             epoch_started = time.perf_counter()
             model.train()
             total_loss = 0.0
+            total_supervised_loss = 0.0
+            total_consistency_loss = 0.0
             for images, masks, _ in train_loader:
                 images = images.to(device, non_blocking=True)
                 masks = masks.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                    outputs = model(images)
-                    loss = segmentation_objective(
-                        loss_name, outputs, masks, deep_supervision
-                    )
+                if ema_model is None:
+                    with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                        outputs = model(images)
+                        supervised_loss = segmentation_objective(
+                            loss_name, outputs, masks, deep_supervision
+                        )
+                    consistency_loss = supervised_loss.new_zeros(())
+                    loss = supervised_loss
+                else:
+                    teacher_images = _photometric_view(images, 0.025)
+                    student_images = _photometric_view(images, 0.1)
+                    with torch.no_grad(), torch.autocast(
+                        device_type=device.type, enabled=amp_enabled
+                    ):
+                        teacher_logits = _final_logits(ema_model(teacher_images))
+                    with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                        student_outputs = model(student_images)
+                        student_logits = _final_logits(student_outputs)
+                        supervised_loss = segmentation_objective(
+                            loss_name, student_outputs, masks, deep_supervision
+                        )
+                        consistency_loss = _confidence_consistency_loss(
+                            student_logits, teacher_logits
+                        )
+                        consistency_scale = min(
+                            1.0, (epoch + 1) / consistency_rampup_epochs
+                        )
+                        loss = (
+                            supervised_loss
+                            + consistency_weight
+                            * consistency_scale
+                            * consistency_loss
+                        )
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+                if ema_model is not None:
+                    _update_ema_model(ema_model, model, ema_decay)
                 total_loss += float(loss.detach()) * len(images)
+                total_supervised_loss += float(supervised_loss.detach()) * len(images)
+                total_consistency_loss += float(consistency_loss.detach()) * len(images)
 
             validation_dice = _validate_epoch(
-                model, validation_loader, device, threshold
+                ema_model if ema_model is not None else model,
+                validation_loader,
+                device,
+                threshold,
             )
             scheduler.step(validation_dice)
             epoch_record = {
                 "epoch": epoch + 1,
                 "train_loss": total_loss / max(1, len(effective_training_cases)),
+                "supervised_loss": total_supervised_loss
+                / max(1, len(effective_training_cases)),
+                "consistency_loss": total_consistency_loss
+                / max(1, len(effective_training_cases)),
                 "validation_dice": validation_dice,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "epoch_seconds": time.perf_counter() - epoch_started,
@@ -1043,14 +1241,21 @@ def train_cross_validation(
                 epochs_without_improvement = 0
                 best_model_state = {
                     name: tensor.detach().cpu().clone()
-                    for name, tensor in model.state_dict().items()
+                    for name, tensor in (
+                        ema_model if ema_model is not None else model
+                    ).state_dict().items()
                 }
                 _atomic_torch_save(
                     checkpoint_path,
                     {
                         "model_state": best_model_state,
+                        "selected_weights": (
+                            "ema_teacher" if ema_model is not None else "student"
+                        ),
                         "model_name": model_name,
                         "loss_name": loss_name,
+                        "consistency_weight": consistency_weight,
+                        "ema_decay": ema_decay if ema_model is not None else None,
                         "deep_supervision": deep_supervision,
                         "small_polyp_crop_probability": small_polyp_crop_probability,
                         "preprocessing": preprocessing,
@@ -1063,24 +1268,24 @@ def train_cross_validation(
             else:
                 epochs_without_improvement += 1
             _atomic_json_write(fold_dir / "training_history.json", history)
-            _atomic_torch_save(
-                latest_checkpoint_path,
-                {
-                    "model_name": model_name,
-                    "loss_name": loss_name,
-                    "completed_epoch": epoch + 1,
-                    "max_epochs": epochs,
-                    "model_state": model.state_dict(),
-                    "best_model_state": best_model_state,
-                    "optimizer_state": optimizer.state_dict(),
-                    "scheduler_state": scheduler.state_dict(),
-                    "scaler_state": scaler.state_dict(),
-                    "best_validation_dice": best_dice,
-                    "epochs_without_improvement": epochs_without_improvement,
-                    "history": history,
-                    "rng_state": _capture_rng_state(),
-                },
-            )
+            latest_checkpoint: dict[str, object] = {
+                "model_name": model_name,
+                "loss_name": loss_name,
+                "completed_epoch": epoch + 1,
+                "max_epochs": epochs,
+                "model_state": model.state_dict(),
+                "best_model_state": best_model_state,
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "scaler_state": scaler.state_dict(),
+                "best_validation_dice": best_dice,
+                "epochs_without_improvement": epochs_without_improvement,
+                "history": history,
+                "rng_state": _capture_rng_state(),
+            }
+            if ema_model is not None:
+                latest_checkpoint["ema_model_state"] = ema_model.state_dict()
+            _atomic_torch_save(latest_checkpoint_path, latest_checkpoint)
             _log_progress(
                 progress_log,
                 "epoch_completed",
@@ -1089,6 +1294,8 @@ def train_cross_validation(
                 epoch=epoch + 1,
                 max_epochs=epochs,
                 train_loss=epoch_record["train_loss"],
+                supervised_loss=epoch_record["supervised_loss"],
+                consistency_loss=epoch_record["consistency_loss"],
                 validation_dice=validation_dice,
                 epoch_seconds=epoch_record["epoch_seconds"],
                 best_validation_dice=best_dice,
@@ -1102,7 +1309,8 @@ def train_cross_validation(
                 checkpoint_path, map_location=device, weights_only=True
             )
             best_model_state = checkpoint["model_state"]
-        model.load_state_dict(best_model_state)
+        evaluation_model = ema_model if ema_model is not None else model
+        evaluation_model.load_state_dict(best_model_state)
         test_loader = _make_loader(
             test_cases,
             image_size,
@@ -1113,7 +1321,7 @@ def train_cross_validation(
             imagenet_normalize=pretrained_encoder,
         )
         test_metrics, fold_per_image_rows = _predict_outer_test(
-            model,
+            evaluation_model,
             test_cases,
             test_loader,
             device,
@@ -1123,11 +1331,12 @@ def train_cross_validation(
             overlays,
             sessile_case_ids,
             dense_crf=dense_crf,
+            write_predictions=write_predictions,
         )
         tta_per_image_rows: list[dict[str, object]] = []
         if test_time_augmentation:
             tta_metrics, tta_per_image_rows = _predict_outer_test(
-                model,
+                evaluation_model,
                 test_cases,
                 test_loader,
                 device,
@@ -1137,6 +1346,7 @@ def train_cross_validation(
                 False,
                 sessile_case_ids,
                 test_time_augmentation=True,
+                write_predictions=write_predictions,
             )
         else:
             tta_metrics = {}
@@ -1193,7 +1403,7 @@ def train_cross_validation(
             total_folds=n_splits,
             metrics=test_metrics,
         )
-        del model, optimizer, scaler
+        del model, optimizer, scaler, ema_model
         if device.type == "cuda":
             torch.cuda.empty_cache()
 

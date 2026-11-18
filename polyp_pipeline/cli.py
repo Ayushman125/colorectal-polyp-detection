@@ -12,6 +12,7 @@ from .dataset_prep import prepare_zenodo_datasets
 from .deep import evaluate_external_sets, train_cross_validation
 from .models import MODEL_SPECS
 from .report import generate_report
+from .research_benchmark import run_frequency_boundary_benchmark
 from .specialized_benchmark import run_specialized_benchmark
 
 
@@ -47,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
             "weighted_bce_iou",
             "focal_tversky",
             "dice_boundary",
+            "bce_dice_boundary",
         ),
         default="bce_dice",
     )
@@ -60,7 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     deep.add_argument("--num-workers", type=int, default=0)
     deep.add_argument("--pretrained-encoder", action="store_true")
     deep.add_argument("--test-time-augmentation", action="store_true")
+    deep.add_argument("--consistency-weight", type=float, default=0.0)
+    deep.add_argument("--ema-decay", type=float, default=0.99)
+    deep.add_argument("--consistency-rampup-epochs", type=int, default=5)
     deep.add_argument("--no-overlays", action="store_true")
+    deep.add_argument("--no-predictions", action="store_true")
 
     classical = commands.add_parser(
         "classical", help="Run image-grouped Random Forest and SVM patch baselines."
@@ -117,6 +123,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("kvasir-sessile") / "sessile-main-Kvasir-SEG" / "images",
     )
     advanced.add_argument("--no-overlays", action="store_true")
+
+    research = commands.add_parser(
+        "frequency-boundary-benchmark",
+        help="Run/resume Swin frequency, boundary-loss, and EMA consistency ablations.",
+    )
+    research.add_argument(
+        "--dataset-root", type=Path, default=Path("kvasir-seg") / "Kvasir-SEG"
+    )
+    research.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("runs") / "frequency_boundary_benchmark",
+    )
+    research.add_argument("--folds", type=int, default=5)
+    research.add_argument("--seed", type=int, default=42)
+    research.add_argument("--size", type=int, default=352)
+    research.add_argument("--batch-size", type=int, default=2)
+    research.add_argument("--epochs", type=int, default=30)
+    research.add_argument("--patience", type=int, default=6)
+    research.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    research.add_argument("--num-workers", type=int, default=0)
+    research.add_argument(
+        "--sessile-image-dir",
+        type=Path,
+        default=Path("kvasir-sessile") / "sessile-main-Kvasir-SEG" / "images",
+    )
+    research.add_argument("--no-overlays", action="store_true")
 
     specialized = commands.add_parser(
         "specialized-benchmark",
@@ -287,6 +320,10 @@ def main() -> None:
             num_workers=args.num_workers,
             overlays=not args.no_overlays,
             test_time_augmentation=args.test_time_augmentation,
+            consistency_weight=args.consistency_weight,
+            ema_decay=args.ema_decay,
+            consistency_rampup_epochs=args.consistency_rampup_epochs,
+            write_predictions=not args.no_predictions,
         )
     elif args.command == "classical":
         output_dir = args.output_dir / f"classical_{args.preprocessing}"
@@ -306,6 +343,27 @@ def main() -> None:
             else set()
         )
         state = run_advanced_benchmark(
+            cases,
+            args.output_dir,
+            n_splits=args.folds,
+            seed=args.seed,
+            image_size=args.size,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            patience=args.patience,
+            device_name=args.device,
+            num_workers=args.num_workers,
+            sessile_case_ids=sessile_case_ids,
+            overlays=not args.no_overlays,
+        )
+        print(json.dumps(state, indent=2))
+    elif args.command == "frequency-boundary-benchmark":
+        sessile_case_ids = (
+            {path.stem for path in args.sessile_image_dir.glob("*") if path.is_file()}
+            if args.sessile_image_dir.is_dir()
+            else set()
+        )
+        state = run_frequency_boundary_benchmark(
             cases,
             args.output_dir,
             n_splits=args.folds,

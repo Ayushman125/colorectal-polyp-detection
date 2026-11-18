@@ -28,10 +28,17 @@ MODEL_SPECS = {
     "upernet_mit_b0": ModelSpec("UPerNet", "mit_b0"),
     "pranet_resnet34": ModelSpec("PraNetStyle", "resnet34"),
     "transfuse_resnet34_swin_tiny": ModelSpec("TransFuseStyle", "resnet34+swin_tiny"),
+    "transfuse_frequency_swin_tiny": ModelSpec(
+        "TransFuseFrequencyStyle", "resnet34+swin_tiny"
+    ),
 }
 
 
-DEEP_SUPERVISION_MODELS = {"pranet_resnet34", "transfuse_resnet34_swin_tiny"}
+DEEP_SUPERVISION_MODELS = {
+    "pranet_resnet34",
+    "transfuse_resnet34_swin_tiny",
+    "transfuse_frequency_swin_tiny",
+}
 
 
 def build_model(
@@ -44,8 +51,16 @@ def build_model(
         )
     if name == "pranet_resnet34":
         return PraNetStyle(pretrained=pretrained_encoder)
-    if name == "transfuse_resnet34_swin_tiny":
-        return TransFuseStyle(pretrained=pretrained_encoder, image_size=image_size)
+    if name in {
+        "transfuse_resnet34_swin_tiny",
+        "transfuse_frequency_swin_tiny",
+    }:
+        frequency_fusion = name == "transfuse_frequency_swin_tiny"
+        return TransFuseStyle(
+            pretrained=pretrained_encoder,
+            image_size=image_size,
+            frequency_fusion=frequency_fusion,
+        )
     try:
         import segmentation_models_pytorch as smp
     except ImportError as error:
@@ -115,15 +130,23 @@ def dice_boundary_loss(
     target: torch.Tensor,
     boundary_weight: float = 0.1,
 ) -> torch.Tensor:
-    if boundary_weight < 0:
-        raise ValueError("boundary_weight must be non-negative")
-    from scipy.ndimage import distance_transform_edt
-
+    if not np.isfinite(boundary_weight) or boundary_weight < 0:
+        raise ValueError("boundary_weight must be finite and non-negative")
     probabilities = torch.sigmoid(logits)
     dimensions = (1, 2, 3)
     intersection = (probabilities * target).sum(dim=dimensions)
     denominator = probabilities.sum(dim=dimensions) + target.sum(dim=dimensions)
     dice = (2.0 * intersection + 1.0) / (denominator + 1.0)
+    distance_map = _signed_distance_map(target, probabilities)
+    boundary = (probabilities * distance_map).mean(dim=dimensions)
+    return (1.0 - dice + boundary_weight * boundary).mean()
+
+
+def _signed_distance_map(
+    target: torch.Tensor, reference: torch.Tensor
+) -> torch.Tensor:
+    from scipy.ndimage import distance_transform_edt
+
     binary_targets = target.detach().to(device="cpu").numpy()[:, 0] > 0.5
     signed_distances = []
     normalizer = max(target.shape[-2:])
@@ -134,11 +157,34 @@ def dice_boundary_loss(
         signed_distances.append(signed.astype("float32"))
     distance_map = torch.as_tensor(
         np.stack(signed_distances),
-        dtype=probabilities.dtype,
-        device=probabilities.device,
+        dtype=reference.dtype,
+        device=reference.device,
     )[:, None]
-    boundary = (probabilities * distance_map).mean(dim=dimensions)
-    return (1.0 - dice + boundary_weight * boundary).mean()
+    return distance_map
+
+
+def bce_dice_boundary_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    boundary_weight: float = 0.1,
+) -> torch.Tensor:
+    if not np.isfinite(boundary_weight) or boundary_weight < 0:
+        raise ValueError("boundary_weight must be finite and non-negative")
+    logits_float = logits.float()
+    target_float = target.float()
+    probabilities = torch.sigmoid(logits_float)
+    bce = nn.functional.binary_cross_entropy_with_logits(
+        logits_float, target_float
+    )
+    dimensions = (1, 2, 3)
+    intersection = (probabilities * target_float).sum(dim=dimensions)
+    denominator = probabilities.sum(dim=dimensions) + target_float.sum(
+        dim=dimensions
+    )
+    dice_loss = 1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
+    signed_distance = _signed_distance_map(target, probabilities)
+    boundary = (probabilities * signed_distance).mean()
+    return bce + dice_loss.mean() + boundary_weight * boundary
 
 
 def segmentation_loss(name: str, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -152,6 +198,8 @@ def segmentation_loss(name: str, logits: torch.Tensor, target: torch.Tensor) -> 
         return focal_tversky_loss(logits, target)
     if name == "dice_boundary":
         return dice_boundary_loss(logits, target)
+    if name == "bce_dice_boundary":
+        return bce_dice_boundary_loss(logits, target)
     raise ValueError(f"Unsupported loss: {name}")
 
 

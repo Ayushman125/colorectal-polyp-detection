@@ -578,9 +578,138 @@ contains sessile/small-box subgroup results. The plots are in
 [ablation_and_model_comparison.png](reports/external_joint/ablation_and_model_comparison.png).
 Datasets and checkpoints remain outside the repository.
 
+## Frequency, boundary, and EMA-consistency study
+
+The current Swin branch is a ResNet-34/Swin-Tiny hybrid (TransFuse-style).
+This experiment keeps that backbone and adds a lightweight fixed-Haar
+frequency-fusion block after each fused feature scale; it does not claim to
+implement Vision Mamba or a paper's exact VMDU-Net/Swin-MSEG-Pro architecture.
+For each channel, a 2 x 2 Haar transform produces one low-frequency component
+and three detail components (horizontal, vertical, and diagonal). Learned
+1 x 1 projections combine the low-frequency and detail branches, and a
+learned gate applies the result residually to the spatial feature. Odd-sized
+feature maps are replicate-padded before the transform and restored to their
+original size afterward. This is a feature-fusion inductive bias, not a
+guaranteed glare-removal operation; the existing specular preprocessing
+remains separate.
+
+For one 2 x 2 patch with values `(a, b; c, d)`, the normalized Haar
+coefficients are
+`LL=(a+b+c+d)/2`, `LH=(a-b+c-d)/2`,
+`HL=(a+b-c-d)/2`, and `HH=(a-b-c+d)/2`.
+At each feature scale, the three detail maps are concatenated and projected
+separately from `LL`; both branches are resized back to the feature resolution.
+The fusion is
+`X' = ReLU(BN(X + sigmoid(Conv1x1([X, Xlow, Xhigh])) * (Xlow + Xhigh)))`.
+
+The boundary arm uses the full-resolution objective
+`L = L_BCE + L_Dice + 0.1 L_signed-distance`. The signed Euclidean distance
+map is negative inside the foreground, positive outside, and normalized by
+the larger image dimension; `L_signed-distance = mean(sigmoid(z) * d)`.
+Distance maps are computed only from the training batch's ground-truth masks.
+The existing Dice-plus-distance loss benchmark remains unchanged, so its
+previous results are not silently redefined.
+
+The final arm adds a Mean Teacher-style consistency regularizer. An EMA teacher
+with decay 0.99 predicts a weak photometric view; the student receives a
+stronger photometric view with the same geometry. Mean-squared probability
+consistency is applied only where the teacher probability is at least 0.7 or
+at most 0.3, and its weight 0.1 is linearly ramped up over five epochs. The
+teacher is updated after student optimizer steps; validation selects the EMA
+weights and the outer-fold test data are used only once for evaluation.
+Kvasir-SEG and the auxiliary datasets available here are labeled, and there is
+no separate unlabeled training corpus. Accordingly, this is consistency
+regularization on labeled training-fold images, not evidence of a true
+semi-supervised gain or of pseudo-labeling on held-out data.
+
+The comparison consists of a matched pretrained TransFuse/Swin BCE+Dice
+reference, the same model with BCE+Dice+boundary loss, frequency fusion with
+that boundary loss, and frequency fusion plus the EMA consistency term. The
+reference reuses the already completed Kvasir-only TransFuse run; the three
+new conditions share its five image-level folds, seed 42, CLAHE preprocessing,
+ImageNet encoders, no small-polyp crop, no deep supervision, and four-view TTA.
+Each fold trains only on its training partition, selects checkpoints using
+its inner validation subset, and evaluates the outer fold once. The run is
+resumable from atomic epoch checkpoints and records the fold manifests,
+training history, configuration, and metrics outside Git.
+If an epoch checkpoint is unreadable, the runner records a recovery event and
+warm-starts from the valid best-validation weights, resetting optimizer and
+random-number state; that fallback is not an exact continuation.
+
+```powershell
+python -m polyp_pipeline frequency-boundary-benchmark `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "D:\PolypRuns\frequency_boundary" `
+  --folds 5 --seed 42 --size 352 `
+  --batch-size 2 --epochs 30 --patience 6 `
+  --device cuda --no-overlays
+```
+
+Rerun the same command after interruption to continue from the latest epoch or,
+if needed, recover from the best-validation checkpoint as described above.
+To combine the original matched baseline with the new ablations:
+
+```powershell
+python -m polyp_pipeline report `
+  --input-dir "runs\specialized_benchmark\deep\transfuse_resnet34_swin_tiny__ds-0__small-crop-0.0__kvasir_only" `
+  --input-dir "D:\PolypRuns\frequency_boundary" `
+  --output-dir "reports\frequency_boundary"
+```
+
+The resulting report contains fold mean and sample SD for segmentation,
+localization, speed, and TTA, plus sessile/small-box subgroup summaries.
+These results must be interpreted alongside the earlier boundary-loss
+ablation, which did not improve mean Dice, and should not be assumed to reach
+0.93-0.95. Literature scores from different splits, preprocessing,
+post-processing, or training data are not directly comparable to this
+five-fold protocol.
+
 The target Dice range of 0.93-0.95 is an experimental goal, not a guaranteed
 outcome. Report only completed held-out results; do not tune architecture,
 thresholds, or CRF parameters against outer-test metrics.
+
+### Measured frequency, boundary, and EMA results
+
+All four Kvasir conditions below use the same five outer folds and inner
+validation splits. Values are mean +/- sample standard deviation across folds.
+
+| TransFuse-style condition | Ordinary Dice | TTA Dice | mIoU | Sensitivity | Pixel specificity | AP50 | FPS | TTA FPS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Matched BCE+Dice baseline | 0.8787 +/- 0.0180 | 0.8879 +/- 0.0177 | 0.8124 +/- 0.0215 | 0.8622 +/- 0.0306 | 0.9856 +/- 0.0041 | 0.8638 +/- 0.0319 | 28.1 +/- 0.6 | 7.4 +/- 0.1 |
+| Spatial BCE+Dice+boundary | 0.8738 +/- 0.0218 | 0.8827 +/- 0.0190 | 0.8041 +/- 0.0266 | 0.8688 +/- 0.0246 | 0.9814 +/- 0.0039 | 0.8630 +/- 0.0343 | 24.1 +/- 1.5 | 6.3 +/- 0.5 |
+| Haar frequency + BCE+Dice+boundary | **0.8891 +/- 0.0067** | **0.8948 +/- 0.0095** | **0.8243 +/- 0.0083** | 0.8782 +/- 0.0166 | 0.9850 +/- 0.0011 | **0.8767 +/- 0.0202** | 23.6 +/- 0.3 | 6.2 +/- 0.0 |
+| Haar frequency + boundary + EMA consistency | 0.8782 +/- 0.0208 | 0.8851 +/- 0.0177 | 0.8130 +/- 0.0273 | 0.87197 +/- 0.0306 | 0.9838 +/- 0.0032 | 0.8596 +/- 0.0323 | 23.4 +/- 0.8 | 6.2 +/- 0.2 |
+
+The fixed-Haar condition improved ordinary Dice by 0.0104 over the matched
+baseline and 0.0153 over the spatial boundary arm. TTA raised the Haar
+condition to 0.8948, close to the project-wide pretrained FPN BCE+Dice TTA
+result of 0.895 but not above it. The boundary-only spatial result did not
+improve over the matched BCE+Dice baseline in this experiment, consistent with
+the earlier boundary-loss ablation. EMA consistency did not improve the Haar
+arm: it was lower than Haar boundary by 0.0109 Dice and 0.0097 TTA Dice.
+
+TTA and Haar fusion both add a throughput cost. The matched baseline measured
+28.1 ordinary FPS, while the Haar result measured 23.6 ordinary FPS and 6.2
+FPS for four-view TTA. These measurements are hardware-dependent and exclude
+dataset loading and writing.
+
+### Measured external-domain results
+
+The completed frequency ablations were evaluated on 62 ClinicDB, 380 ColonDB,
+and 196 ETIS held-out images using the five fold-specific Kvasir checkpoints.
+The tables below report mean +/- sample SD across checkpoints.
+
+| Dataset | Spatial boundary ordinary / TTA Dice | Haar boundary ordinary / TTA Dice | Haar boundary + EMA ordinary / TTA Dice |
+|---|---:|---:|---:|
+| ClinicDB | 0.6889 +/- 0.0252 / 0.7142 +/- 0.0289 | **0.7535 +/- 0.0134 / 0.7620 +/- 0.0156** | 0.7158 +/- 0.0403 / 0.7232 +/- 0.0360 |
+| ColonDB | 0.6223 +/- 0.0429 / 0.6322 +/- 0.0373 | **0.6624 +/- 0.0218 / 0.6627 +/- 0.0250** | 0.6412 +/- 0.0258 / 0.6446 +/- 0.0310 |
+| ETIS-LaribPolypDB | 0.4908 +/- 0.0746 / 0.4884 +/- 0.0534 | **0.5734 +/- 0.0419 / 0.5542 +/- 0.0369** | 0.5121 +/- 0.0748 / 0.4899 +/- 0.0706 |
+
+The fixed-Haar boundary arm was strongest on all three external datasets.
+Joint-dataset or domain-adaptation checkpoints are separate previous results,
+not mixed into this table. The 0.93-0.95 target was not reached in this
+Kvasir-only study. External results remain substantially lower than Kvasir
+performance and must not be presented as clinical validation.
 
 ## Pipeline details
 

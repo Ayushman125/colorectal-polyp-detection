@@ -16,6 +16,61 @@ def _conv_block(in_channels: int, out_channels: int) -> nn.Sequential:
     )
 
 
+class HaarFrequencyFusion(nn.Module):
+    """Fuse fixed Haar low- and high-frequency feature components."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        filters = torch.tensor(
+            [
+                [[1.0, 1.0], [1.0, 1.0]],
+                [[1.0, -1.0], [1.0, -1.0]],
+                [[1.0, 1.0], [-1.0, -1.0]],
+                [[1.0, -1.0], [-1.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        ).div_(2.0)
+        self.register_buffer(
+            "haar_filters",
+            filters[:, None].repeat(channels, 1, 1, 1),
+            persistent=False,
+        )
+        self.channels = channels
+        self.low_projection = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.high_projection = nn.Conv2d(
+            3 * channels, channels, kernel_size=1, bias=False
+        )
+        self.gate = nn.Conv2d(3 * channels, channels, kernel_size=1)
+        self.normalization = nn.BatchNorm2d(channels)
+
+    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+        height, width = feature.shape[-2:]
+        padded = F.pad(feature, (0, width % 2, 0, height % 2), mode="replicate")
+        coefficients = F.conv2d(
+            padded, self.haar_filters, stride=2, groups=self.channels
+        )
+        batch, _, reduced_height, reduced_width = coefficients.shape
+        coefficients = coefficients.reshape(
+            batch, self.channels, 4, reduced_height, reduced_width
+        )
+        low = coefficients[:, :, 0]
+        high = coefficients[:, :, 1:].reshape(
+            batch, self.channels * 3, reduced_height, reduced_width
+        )
+        size = (height, width)
+        low = F.interpolate(
+            self.low_projection(low), size=size, mode="bilinear", align_corners=False
+        )
+        high = F.interpolate(
+            self.high_projection(high),
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        gate = torch.sigmoid(self.gate(torch.cat((feature, low, high), dim=1)))
+        return F.relu(self.normalization(feature + gate * (low + high)), inplace=True)
+
+
 class PraNetStyle(nn.Module):
     """ResNet reverse-attention segmentation network with multi-scale heads."""
 
@@ -76,7 +131,12 @@ class PraNetStyle(nn.Module):
 class TransFuseStyle(nn.Module):
     """CNN/Swin feature fusion network with multi-scale segmentation heads."""
 
-    def __init__(self, pretrained: bool = True, image_size: int = 352) -> None:
+    def __init__(
+        self,
+        pretrained: bool = True,
+        image_size: int = 352,
+        frequency_fusion: bool = False,
+    ) -> None:
         super().__init__()
         try:
             import timm
@@ -112,6 +172,10 @@ class TransFuseStyle(nn.Module):
             nn.Conv2d(128, 64, kernel_size=1) for _ in cnn_channels
         )
         self.fusion = nn.ModuleList(_conv_block(128, 64) for _ in cnn_channels)
+        self.frequency_fusion = nn.ModuleList(
+            HaarFrequencyFusion(64) if frequency_fusion else nn.Identity()
+            for _ in cnn_channels
+        )
         self.decoder = nn.ModuleList(_conv_block(64, 64) for _ in range(3))
         self.auxiliary_heads = nn.ModuleList(
             nn.Conv2d(64, 1, kernel_size=1) for _ in range(2)
@@ -122,7 +186,7 @@ class TransFuseStyle(nn.Module):
         cnn_features = self.cnn_encoder(image)
         transformer_features = self.transformer_encoder(image)
         fused = []
-        for cnn, transformer, cnn_projection, transformer_projection, cnn_gate, transformer_gate, fusion in zip(
+        for cnn, transformer, cnn_projection, transformer_projection, cnn_gate, transformer_gate, fusion, frequency_fusion in zip(
             cnn_features,
             transformer_features,
             self.cnn_projection,
@@ -130,6 +194,7 @@ class TransFuseStyle(nn.Module):
             self.cnn_gates,
             self.transformer_gates,
             self.fusion,
+            self.frequency_fusion,
         ):
             cnn = cnn_projection(cnn)
             if transformer.shape[1] != transformer_projection.in_channels:
@@ -143,7 +208,11 @@ class TransFuseStyle(nn.Module):
             transformer_fused = transformer + torch.sigmoid(
                 transformer_gate(joint)
             ) * cnn
-            fused.append(fusion(torch.cat((cnn_fused, transformer_fused), dim=1)))
+            fused.append(
+                frequency_fusion(
+                    fusion(torch.cat((cnn_fused, transformer_fused), dim=1))
+                )
+            )
 
         decoded = fused[-1]
         for decoder, skip in zip(self.decoder, reversed(fused[:-1])):

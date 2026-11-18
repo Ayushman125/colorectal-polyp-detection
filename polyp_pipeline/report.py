@@ -75,9 +75,25 @@ def _read_result_rows(input_dirs: Path | list[Path]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for root in _input_roots(input_dirs):
         for path in root.rglob("fold_metrics.csv"):
+            config_path = path.parent / "run_config.json"
+            config = (
+                json.loads(config_path.read_text(encoding="utf-8"))
+                if config_path.is_file()
+                else {}
+            )
             with path.open(newline="", encoding="utf-8") as file:
                 for source_row in csv.DictReader(file):
                     row = dict(source_row)
+                    row.setdefault(
+                        "consistency_weight",
+                        config.get("consistency_weight", 0.0),
+                    )
+                    row.setdefault(
+                        "ema_decay",
+                        config.get("ema_decay", "")
+                        if float(config.get("consistency_weight", 0.0)) > 0.0
+                        else "",
+                    )
                     rows.append(row)
                     if row.get("tta_dice") not in (None, ""):
                         tta_row = {
@@ -132,13 +148,31 @@ def _write_external_report(
     rows: list[dict[str, str]] = []
     for root in _input_roots(input_dirs):
         for path in root.rglob("external_metrics.csv"):
+            config_path = path.parent / "run_config.json"
+            config = (
+                json.loads(config_path.read_text(encoding="utf-8"))
+                if config_path.is_file()
+                else {}
+            )
             with path.open(newline="", encoding="utf-8") as file:
-                rows.extend(csv.DictReader(file))
+                for source_row in csv.DictReader(file):
+                    row = dict(source_row)
+                    row.setdefault(
+                        "consistency_weight",
+                        config.get("consistency_weight", 0.0),
+                    )
+                    row.setdefault(
+                        "ema_decay",
+                        config.get("ema_decay", "")
+                        if float(config.get("consistency_weight", 0.0)) > 0.0
+                        else "",
+                    )
+                    rows.append(row)
     if not rows:
         return
 
     grouped: dict[
-        tuple[str, str, str, str, str, str], list[dict[str, str]]
+        tuple[str, str, str, str, str, str, str, str], list[dict[str, str]]
     ] = defaultdict(list)
     for row in rows:
         key = (
@@ -148,6 +182,8 @@ def _write_external_report(
             row.get("deep_supervision", "0"),
             row.get("small_polyp_crop_probability", "0"),
             row.get("auxiliary_training_cases", "0"),
+            str(row.get("consistency_weight", "0")),
+            str(row.get("ema_decay", "")),
         )
         grouped[key].append(row)
 
@@ -159,6 +195,8 @@ def _write_external_report(
         deep_supervision,
         crop_probability,
         auxiliary_count,
+        consistency_weight,
+        ema_decay,
     ), group in sorted(grouped.items()):
         record: dict[str, Any] = {
             "model": model,
@@ -172,6 +210,8 @@ def _write_external_report(
             "deep_supervision": deep_supervision,
             "small_polyp_crop_probability": crop_probability,
             "auxiliary_training_cases": auxiliary_count,
+            "consistency_weight": consistency_weight,
+            "ema_decay": ema_decay,
         }
         for metric in EXTERNAL_METRICS:
             values = []
@@ -197,7 +237,9 @@ def _write_external_report(
 
 def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
     rows = _read_result_rows(input_dir)
-    grouped: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[
+        tuple[str, str, str, str, str, str, str, str], list[dict[str, Any]]
+    ] = defaultdict(list)
     for row in rows:
         key = (
             str(row.get("model", "unknown")),
@@ -206,13 +248,24 @@ def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
             str(row.get("deep_supervision", "0")),
             str(row.get("small_polyp_crop_probability", "0")),
             str(row.get("auxiliary_training_cases", "0")),
+            str(row.get("consistency_weight", "0")),
+            str(row.get("ema_decay", "")),
         )
         grouped[key].append(row)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     table_path = output_dir / "benchmark_comparison.csv"
     report_rows: list[dict[str, Any]] = []
-    for (model, preprocessing, loss, deep_supervision, crop_probability, auxiliary_count), group in sorted(grouped.items()):
+    for (
+        model,
+        preprocessing,
+        loss,
+        deep_supervision,
+        crop_probability,
+        auxiliary_count,
+        consistency_weight,
+        ema_decay,
+    ), group in sorted(grouped.items()):
         record: dict[str, Any] = {
             "model": model,
             "preprocessing": preprocessing,
@@ -221,6 +274,8 @@ def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
             "deep_supervision": deep_supervision,
             "small_polyp_crop_probability": crop_probability,
             "auxiliary_training_cases": auxiliary_count,
+            "consistency_weight": consistency_weight,
+            "ema_decay": ema_decay,
         }
         for metric in METRICS:
             values = []
@@ -256,7 +311,8 @@ def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
         with path.open(newline="", encoding="utf-8") as file:
             image_rows = list(csv.DictReader(file))
         grouped_images: dict[
-            tuple[str, str, str, str, str, str, str], list[dict[str, str]]
+            tuple[str, str, str, str, str, str, str, str, str],
+            list[dict[str, str]],
         ] = defaultdict(list)
         for row in image_rows:
             model_name = row.get("model", config.get("model", "unknown"))
@@ -275,6 +331,12 @@ def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
                         str(int(bool(config.get("deep_supervision", False)))),
                         str(config.get("small_polyp_crop_probability", 0.0)),
                         str(len(config.get("auxiliary_case_ids", []))),
+                        str(config.get("consistency_weight", 0.0)),
+                        str(
+                            config.get("ema_decay", "")
+                            if float(config.get("consistency_weight", 0.0)) > 0.0
+                            else ""
+                        ),
                         metric_prefix,
                     )
                 ].append(row)
@@ -285,6 +347,8 @@ def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
             deep_supervision,
             crop_probability,
             auxiliary_count,
+            consistency_weight,
+            ema_decay,
             metric_prefix,
         ), model_rows in grouped_images.items():
             groups = {
@@ -321,6 +385,8 @@ def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
                     "auxiliary_training_cases": auxiliary_count,
                     "subgroup": subgroup,
                     "image_count": len(selected_rows),
+                    "consistency_weight": consistency_weight,
+                    "ema_decay": ema_decay,
                 }
                 for metric in ("dice", "miou", "sensitivity", "specificity"):
                     values = [
@@ -355,6 +421,7 @@ def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
         short_names = {
             "pranet_resnet34": "PraNet / R34",
             "transfuse_resnet34_swin_tiny": "TransFuse / Swin-T",
+            "transfuse_frequency_swin_tiny": "TransFuse + Haar / Swin-T",
             "deeplabv3plus_resnet34": "DeepLabV3+ / R34",
             "segformer_mit_b0": "SegFormer / MiT-B0",
             "upernet_mit_b0": "UPerNet / MiT-B0",
@@ -372,7 +439,8 @@ def generate_report(input_dir: Path | list[Path], output_dir: Path) -> Path:
                 f"{short_names.get(model_name, model_name)}{suffix}\n"
                 f"{row['preprocessing']} / {row['loss']}\n"
                 f"DS={row['deep_supervision']} crop="
-                f"{row['small_polyp_crop_probability']}"
+                f"{row['small_polyp_crop_probability']} "
+                f"consistency={row['consistency_weight']}"
             )
         x_positions = list(range(len(labels)))
         figure, axes = plt.subplots(1, 2, figsize=(max(12, len(labels) * 1.8), 6))

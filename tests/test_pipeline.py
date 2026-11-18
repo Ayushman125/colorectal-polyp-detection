@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import hashlib
 import tempfile
@@ -243,7 +244,7 @@ class FeatureAndMetricTests(unittest.TestCase):
 
         targets = torch.zeros(2, 1, 32, 32)
         targets[:, :, 8:24, 8:24] = 1.0
-        for loss_name in ("focal_tversky", "dice_boundary"):
+        for loss_name in ("focal_tversky", "dice_boundary", "bce_dice_boundary"):
             logits = torch.zeros_like(targets, requires_grad=True)
             loss = segmentation_loss(loss_name, logits, targets)
             self.assertTrue(torch.isfinite(loss).item())
@@ -267,7 +268,11 @@ class FeatureAndMetricTests(unittest.TestCase):
 
         from polyp_pipeline.models import build_model
 
-        for name in ("pranet_resnet34", "transfuse_resnet34_swin_tiny"):
+        for name in (
+            "pranet_resnet34",
+            "transfuse_resnet34_swin_tiny",
+            "transfuse_frequency_swin_tiny",
+        ):
             model = build_model(name, pretrained_encoder=False, image_size=128).eval()
             with torch.inference_mode():
                 outputs = model(torch.zeros(1, 3, 128, 128))
@@ -341,6 +346,73 @@ class FeatureAndMetricTests(unittest.TestCase):
         self.assertIn("upernet_mit_b0", {item["model"] for item in plan})
         self.assertIn("focal_tversky", {item["loss"] for item in plan})
         self.assertIn("dice_boundary", {item["loss"] for item in plan})
+
+    def test_frequency_boundary_plan_ablation_cells(self) -> None:
+        from polyp_pipeline.research_benchmark import frequency_boundary_plan
+
+        plan = frequency_boundary_plan()
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(
+            {item["model"] for item in plan},
+            {"transfuse_resnet34_swin_tiny", "transfuse_frequency_swin_tiny"},
+        )
+        self.assertEqual(
+            {float(item["consistency_weight"]) for item in plan}, {0.0, 0.1}
+        )
+        self.assertTrue(all(item["loss"] == "bce_dice_boundary" for item in plan))
+
+    def test_frequency_boundary_runner_resumes_completed_experiments(self) -> None:
+        from polyp_pipeline.research_benchmark import run_frequency_boundary_benchmark
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory) / "benchmark"
+            cases = [Case("case", Path("image.png"), Path("mask.png"))]
+            with patch(
+                "polyp_pipeline.research_benchmark.train_cross_validation",
+                return_value=[],
+            ) as train:
+                state = run_frequency_boundary_benchmark(
+                    cases,
+                    output_dir,
+                    n_splits=2,
+                    device_name="cpu",
+                )
+                self.assertEqual(state["completed_experiments"], 3)
+                self.assertEqual(train.call_count, 3)
+                resumed_state = run_frequency_boundary_benchmark(
+                    cases,
+                    output_dir,
+                    n_splits=2,
+                    device_name="cpu",
+                )
+            self.assertEqual(resumed_state["completed_experiments"], 3)
+            self.assertEqual(train.call_count, 3)
+
+    def test_haar_frequency_fusion_preserves_shape_and_gradients(self) -> None:
+        import torch
+
+        from polyp_pipeline.specialized_models import HaarFrequencyFusion
+
+        module = HaarFrequencyFusion(4)
+        features = torch.randn(2, 4, 31, 34, requires_grad=True)
+        fused = module(features)
+        self.assertEqual(tuple(fused.shape), tuple(features.shape))
+        fused.mean().backward()
+        self.assertIsNotNone(features.grad)
+        self.assertTrue(torch.isfinite(features.grad).all().item())
+
+    def test_confidence_consistency_loss_accumulates_large_masks_in_float32(self) -> None:
+        import torch
+
+        from polyp_pipeline.deep import _confidence_consistency_loss
+
+        student = torch.zeros(1, 1, 352, 352, dtype=torch.float16, requires_grad=True)
+        teacher = torch.full_like(student, 2.0)
+        loss = _confidence_consistency_loss(student, teacher)
+        self.assertTrue(torch.isfinite(loss).item())
+        self.assertGreater(float(loss), 0.0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(student.grad).all().item())
 
     def test_specialized_plan_has_separate_architecture_and_crop_ablations(self) -> None:
         from polyp_pipeline.specialized_benchmark import specialized_benchmark_plan
@@ -486,6 +558,41 @@ class FeatureAndMetricTests(unittest.TestCase):
                 subgroup_csv,
             )
 
+    def test_report_keeps_ema_consistency_ablation_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            runs = root / "runs"
+            for name, consistency_weight in (("supervised", 0.0), ("ema", 0.1)):
+                experiment = runs / name
+                experiment.mkdir(parents=True)
+                (experiment / "run_config.json").write_text(
+                    json.dumps(
+                        {
+                            "model": "transfuse_frequency_swin_tiny",
+                            "loss": "bce_dice_boundary",
+                            "preprocessing": "clahe",
+                            "consistency_weight": consistency_weight,
+                            "ema_decay": 0.99,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (experiment / "fold_metrics.csv").write_text(
+                    "model,loss,preprocessing,fold,dice,miou,sensitivity,specificity\n"
+                    "transfuse_frequency_swin_tiny,bce_dice_boundary,clahe,1,"
+                    "0.8,0.7,0.85,0.98\n",
+                    encoding="utf-8",
+                )
+            generate_report(runs, root / "reports")
+            with (root / "reports" / "benchmark_comparison.csv").open(
+                newline="", encoding="utf-8"
+            ) as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                {row["consistency_weight"] for row in rows}, {"0.0", "0.1"}
+            )
+
     def test_training_resumes_from_last_completed_epoch(self) -> None:
         import torch
         from torch import nn
@@ -554,10 +661,20 @@ class FeatureAndMetricTests(unittest.TestCase):
                         device_name="cpu",
                         overlays=False,
                         test_time_augmentation=True,
+                        consistency_weight=0.1,
                     )
 
             self.assertTrue(
                 (output_dir / "fold_1" / "latest_training.pt").is_file()
+            )
+            latest = torch.load(
+                    output_dir / "fold_1" / "latest_training.pt",
+                    map_location="cpu",
+                    weights_only=False,
+            )
+            self.assertIn("ema_model_state", latest)
+            (output_dir / "fold_1" / "latest_training.pt").write_bytes(
+                b"interrupted checkpoint write"
             )
             with patch(
                 "polyp_pipeline.deep.build_model",
@@ -577,13 +694,23 @@ class FeatureAndMetricTests(unittest.TestCase):
                     device_name="cpu",
                     overlays=False,
                     test_time_augmentation=True,
+                    consistency_weight=0.1,
                 )
             self.assertEqual(len(results), 2)
             self.assertIn("tta_dice", results[0])
             progress = (output_dir / "progress.jsonl").read_text(encoding="utf-8")
             self.assertIn('"event": "fold_resumed"', progress)
+            self.assertIn(
+                '"event": "checkpoint_recovered_from_best_model"', progress
+            )
             self.assertTrue((output_dir / "summary.json").is_file())
             self.assertTrue((output_dir / "per_image_metrics_tta.csv").is_file())
+            best = torch.load(
+                output_dir / "fold_1" / "best_model.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.assertEqual(best["selected_weights"], "ema_teacher")
 
     def test_external_evaluation_loads_fold_checkpoints_and_persists_metrics(self) -> None:
         import torch
