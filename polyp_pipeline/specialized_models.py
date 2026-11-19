@@ -229,3 +229,184 @@ class TransFuseStyle(nn.Module):
             F.interpolate(value, size=image.shape[-2:], mode="bilinear", align_corners=False)
             for value in reversed(scale_logits)
         )
+
+
+class LearnableHaarFrequencyFusion(nn.Module):
+    """Project and learn to gate LL and LH/HL/HH Haar components."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.low_projection = nn.Conv2d(channels, channels, kernel_size=1)
+        self.high_projection = nn.Conv2d(
+            channels * 3, channels, kernel_size=1
+        )
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.normalization = nn.BatchNorm2d(channels)
+
+    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+        height, width = feature.shape[-2:]
+        padded = F.pad(
+            feature,
+            (0, width % 2, 0, height % 2),
+            mode="replicate",
+        )
+        a = padded[..., 0::2, 0::2]
+        b = padded[..., 0::2, 1::2]
+        c = padded[..., 1::2, 0::2]
+        d = padded[..., 1::2, 1::2]
+        low = (a + b + c + d) / 2.0
+        lh = (a - b + c - d) / 2.0
+        hl = (a + b - c - d) / 2.0
+        hh = (a - b - c + d) / 2.0
+
+        low = F.interpolate(
+            self.low_projection(low),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        high = F.interpolate(
+            self.high_projection(torch.cat((lh, hl, hh), dim=1)),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        gate = self.gate(torch.cat((feature, low, high), dim=1))
+        output = feature + gate * low + (1.0 - gate) * high
+        return F.relu(self.normalization(output), inplace=True)
+
+
+class GlobalLocalFusion(nn.Module):
+    """Combine depthwise local context with global channel context."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.local = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                groups=channels,
+                bias=False,
+            ),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.global_projection = nn.Conv2d(
+            channels, channels, kernel_size=1, bias=False
+        )
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+        local = self.local(feature)
+        global_context = self.global_projection(
+            F.adaptive_avg_pool2d(feature, 1)
+        ).expand_as(feature)
+        alpha = self.gate(
+            torch.cat((global_context, local), dim=1)
+        )
+        return feature + alpha * local + (1.0 - alpha) * global_context
+
+
+class MFPSNet(nn.Module):
+    """Frequency-aware FPN-style ResNet-34 segmentation network."""
+
+    def __init__(self, pretrained: bool = True) -> None:
+        super().__init__()
+        try:
+            import segmentation_models_pytorch as smp
+        except ImportError as error:
+            raise RuntimeError(
+                "Install segmentation-models-pytorch to build MFPS-Net."
+            ) from error
+
+        self.encoder = smp.encoders.get_encoder(
+            "resnet34",
+            in_channels=3,
+            depth=5,
+            weights="imagenet" if pretrained else None,
+        )
+        channels = self.encoder.out_channels
+        decoder_width = 64
+        self.level_projections = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(channels[index], decoder_width, kernel_size=1),
+                nn.BatchNorm2d(decoder_width),
+                nn.ReLU(inplace=True),
+            )
+            for index in (2, 3, 4, 5)
+        )
+        self.frequency_fusion = nn.ModuleList(
+            LearnableHaarFrequencyFusion(decoder_width)
+            for _ in range(4)
+        )
+        self.global_local = nn.ModuleList(
+            GlobalLocalFusion(decoder_width) for _ in range(4)
+        )
+        self.decoder_blocks = nn.ModuleList(
+            _conv_block(decoder_width * 2, decoder_width)
+            for _ in range(3)
+        )
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(decoder_width, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
+        self.edge_head = nn.Sequential(
+            nn.Conv2d(decoder_width, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
+
+    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.encoder(image)
+        projected = []
+        for index, projection, frequency, global_local in zip(
+            (2, 3, 4, 5),
+            self.level_projections,
+            self.frequency_fusion,
+            self.global_local,
+        ):
+            level = projection(features[index])
+            level = frequency(level)
+            level = global_local(level)
+            projected.append(level)
+
+        decoded = projected[-1]
+        for decoder, skip in zip(
+            self.decoder_blocks,
+            reversed(projected[:-1]),
+        ):
+            decoded = F.interpolate(
+                decoded,
+                size=skip.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            decoded = decoder(
+                torch.cat((decoded, skip), dim=1)
+            )
+
+        mask_logits = F.interpolate(
+            self.mask_head(decoded),
+            size=image.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        edge_logits = F.interpolate(
+            self.edge_head(decoded),
+            size=image.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return mask_logits, edge_logits

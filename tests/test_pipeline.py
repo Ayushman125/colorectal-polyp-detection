@@ -609,12 +609,54 @@ class FeatureAndMetricTests(unittest.TestCase):
             "pranet_resnet34",
             "transfuse_resnet34_swin_tiny",
             "transfuse_frequency_swin_tiny",
+            "mfps_net",
         ):
             model = build_model(name, pretrained_encoder=False, image_size=128).eval()
             with torch.inference_mode():
                 outputs = model(torch.zeros(1, 3, 128, 128))
-            self.assertEqual(len(outputs), 3)
-            self.assertTrue(all(tuple(output.shape) == (1, 1, 128, 128) for output in outputs))
+            expected_outputs = 2 if name == "mfps_net" else 3
+            self.assertEqual(len(outputs), expected_outputs)
+            self.assertTrue(
+                all(
+                    tuple(output.shape) == (1, 1, 128, 128)
+                    for output in outputs
+                )
+            )
+
+    def test_mfps_net_preserves_odd_shape_and_backpropagates(self) -> None:
+        import torch
+
+        from polyp_pipeline.models import build_model
+
+        model = build_model(
+            "mfps_net", pretrained_encoder=False, image_size=129
+        )
+        image = torch.randn(1, 3, 129, 127, requires_grad=True)
+        mask_logits, edge_logits = model(image)
+        self.assertEqual(tuple(mask_logits.shape), (1, 1, 129, 127))
+        self.assertEqual(tuple(edge_logits.shape), (1, 1, 129, 127))
+        (mask_logits.mean() + edge_logits.mean()).backward()
+        self.assertIsNotNone(image.grad)
+        self.assertTrue(torch.isfinite(image.grad).all().item())
+
+    def test_mfps_mask_and_edge_objective_backpropagates(self) -> None:
+        import torch
+
+        from polyp_pipeline.models import segmentation_objective
+
+        targets = torch.zeros(2, 1, 32, 32)
+        targets[:, :, 8:24, 8:24] = 1.0
+        mask_logits = torch.zeros_like(targets, requires_grad=True)
+        edge_logits = torch.zeros_like(targets, requires_grad=True)
+        loss = segmentation_objective(
+            "bce_dice_edge_boundary",
+            (mask_logits, edge_logits),
+            targets,
+            False,
+        )
+        loss.backward()
+        self.assertIsNotNone(mask_logits.grad)
+        self.assertIsNotNone(edge_logits.grad)
 
     def test_deep_supervision_objective_backpropagates_through_auxiliary_heads(self) -> None:
         import torch

@@ -746,6 +746,110 @@ The edge-loss arm is a separate condition from the earlier Haar study. Its
 performance must be recorded from its own outer-fold metrics, not inferred from
 the prior study.
 
+## MFPS-Net v1 architecture
+
+MFPS-Net v1 is registered as `mfps_net` for the existing `train` command.
+The implementation uses a pretrained ResNet-34 SMP encoder, projected
+multi-scale FPN-style features, learned two-dimensional Haar low/high-frequency
+fusion, and global-local feature interaction. It returns a foreground mask
+logit and a separate full-resolution edge logit. The edge head uses the
+existing morphological-ground-truth-edge supervision:
+
+\[
+L_{\text{total}} =
+L_{\text{BCE}}(z_m,y)+
+(1-Dice(p_m,y))+
+0.1[L_{\text{BCE}}(p_e,E(y))+(1-Dice(p_e,E(y)))]
+\]
+
+where `z_m` is the mask logit, `p_m=sigmoid(z_m)`, `p_e=sigmoid(z_e)`, and
+`E(y)=max_pool(y)+max_pool(-y)` is the morphological boundary map. This v1
+does not include cross-scale gated fusion or deep supervision.
+
+The Haar block accepts odd and even spatial dimensions, including 352x352,
+by replicate padding and exact shape restoration. Tests cover odd-size forward
+passes, edge/mask shape equality, gradient propagation, and joint mask-edge
+backpropagation. The CUDA batch-2 352x352 smoke test was finite and peak
+allocated GPU memory was 385.6 MB.
+
+```powershell
+python -m polyp_pipeline train `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "runs\mfps_net_v1" `
+  --model mfps_net `
+  --loss bce_dice_edge_boundary `
+  --folds 5 --seed 42 --size 352 `
+  --batch-size 2 --epochs 40 --patience 8 `
+  --pretrained-encoder `
+  --device cuda --num-workers 0 `
+  --no-overlays
+```
+
+The command is resumable from atomic per-fold checkpoints. Add TTA at
+evaluation time with `--test-time-augmentation`; keep EMA consistency disabled
+for this first staged comparison unless it is added as a separate ablation.
+The primary matched baseline is pretrained FPN/ResNet-34 BCE+Dice with TTA.
+
+### MFPS-Net v1 five-fold results
+
+The completed run used five outer folds, seed 42, CLAHE, batch size 2, a
+maximum of 40 epochs, patience 8, ImageNet-pretrained ResNet-34 weights,
+CUDA automatic mixed precision, and four-view TTA. Values are mean +/- sample
+standard deviation across the five outer folds:
+
+| Metric | Ordinary | Four-view TTA |
+|---|---:|---:|
+| Dice | 0.8775 +/- 0.0082 | 0.8858 +/- 0.0114 |
+| mIoU | 0.8099 +/- 0.0081 | 0.8216 +/- 0.0122 |
+| Sensitivity | 0.8931 +/- 0.0113 | 0.8962 +/- 0.0170 |
+| Specificity | 0.9763 +/- 0.0030 | 0.9793 +/- 0.0023 |
+| AP50 | 0.8617 +/- 0.0148 | 0.8672 +/- 0.0219 |
+| Bounding-box precision | 0.7290 +/- 0.0512 | 0.7651 +/- 0.0763 |
+| Bounding-box recall | 0.8789 +/- 0.0180 | 0.8826 +/- 0.0176 |
+| FPS | 45.2 +/- 1.5 | 12.2 +/- 0.2 |
+
+| Fold | Best epoch | Best inner-validation Dice | Outer Dice | TTA Dice |
+|---:|---:|---:|---:|---:|
+| 1 | 27 | 0.9077 | 0.8845 | 0.8921 |
+| 2 | 22 | 0.9025 | 0.8722 | 0.8708 |
+| 3 | 11 | 0.8678 | 0.8884 | 0.8999 |
+| 4 | 13 | 0.8975 | 0.8709 | 0.8878 |
+| 5 | 15 | 0.8778 | 0.8718 | 0.8787 |
+
+MFPS-Net v1 has 21.90M parameters and approximately 10.87 GFLOPs per 352x352
+image by THOP. It is not a direct replacement for the 49.78M TransFuse hybrid:
+it is intended as a compact ResNet-34 FPN-style research comparison.
+
+Relative to the existing pretrained FPN/ResNet-34 BCE+Dice reference, whose
+TTA Dice was 0.8950 +/- 0.0160 under the five-fold protocol, MFPS-Net v1 TTA
+Dice was 0.8858 +/- 0.0114. MFPS-Net v1 therefore did not improve on the main
+matched baseline and did not reach the 0.93-0.95 target. The result is not
+interpreted as negative proof against MFPS-Net; it shows that v1's frequency,
+global-local, and edge-head additions did not improve the reference under this
+first 40-epoch configuration. Cross-scale gated fusion and deep supervision
+remain separate future ablations.
+
+The small-box subgroup (13 cases) scored Dice 0.6189 +/- 0.3692, rising to
+0.6245 +/- 0.3687 with TTA. It remains a high-variance small-lesion subgroup
+and should not be used to claim a robust benefit.
+
+External evaluation used the five completed MFPS-Net checkpoints against
+ClinicDB, ColonDB, and ETIS-LaribPolypDB after the Kvasir run. Mean +/- sample
+SD across the five fold-specific checkpoints:
+
+| Dataset | Cases | Ordinary Dice | TTA Dice | mIoU | Sensitivity | AP50 |
+|---|---:|---:|---:|---:|---:|---:|
+| ClinicDB | 62 | 0.7208 +/- 0.0301 | 0.7396 +/- 0.0277 | 0.6440 | 0.7302 | 0.6775 |
+| ColonDB | 380 | 0.6126 +/- 0.0145 | 0.6306 +/- 0.0275 | 0.5362 | 0.5131 | 0.6145 |
+| ETIS-LaribPolypDB | 196 | 0.4960 +/- 0.0435 | 0.4970 +/- 0.0395 | 0.4327 | 0.7670 | 0.4668 |
+
+ClinicDB, ColonDB, and ETIS exact-image duplicate metadata was retained during
+evaluation. The external data are not clinical cohorts and the external scores
+must not be presented as independent-patient validation.
+
+External and Kvasir aggregate CSVs and plots are in
+[reports/mfps_net_v1](reports/mfps_net_v1).
+
 ## Genuine unlabeled-data training
 
 The pipeline can download HyperKvasir's image-only corpus from its public OSF

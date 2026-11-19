@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .specialized_models import PraNetStyle, TransFuseStyle
+from .specialized_models import MFPSNet, PraNetStyle, TransFuseStyle
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ MODEL_SPECS = {
     "transfuse_frequency_swin_tiny": ModelSpec(
         "TransFuseFrequencyStyle", "resnet34+swin_tiny"
     ),
+    "mfps_net": ModelSpec("MFPSNet", "resnet34"),
 }
 
 
@@ -51,6 +52,8 @@ def build_model(
         )
     if name == "pranet_resnet34":
         return PraNetStyle(pretrained=pretrained_encoder)
+    if name == "mfps_net":
+        return MFPSNet(pretrained=pretrained_encoder)
     if name in {
         "transfuse_resnet34_swin_tiny",
         "transfuse_frequency_swin_tiny",
@@ -275,6 +278,38 @@ def segmentation_objective(
         return segmentation_loss(name, outputs, target)
     if not outputs:
         raise ValueError("A segmentation model must return at least one output")
+    if name in {
+        "bce_dice_edge_boundary",
+        "bce_dice_boundary",
+        "dice_boundary",
+    } and len(outputs) == 2:
+        mask_logits = outputs[0]
+        edge_logits = outputs[1]
+        with torch.autocast(device_type=edge_logits.device.type, enabled=False):
+            edge_logits_float = edge_logits.float()
+            target_float = target.float()
+            mask_loss = segmentation_loss("bce_dice", mask_logits.float(), target_float)
+            target_edge = (
+                nn.functional.max_pool2d(
+                    target_float, kernel_size=3, stride=1, padding=1
+                )
+                + nn.functional.max_pool2d(
+                    -target_float, kernel_size=3, stride=1, padding=1
+                )
+            ).clamp_(0.0, 1.0)
+            edge_bce = nn.functional.binary_cross_entropy_with_logits(
+                edge_logits_float, target_edge
+            )
+            predicted_edge = torch.sigmoid(edge_logits_float)
+            dimensions = (1, 2, 3)
+            intersection = (predicted_edge * target_edge).sum(dim=dimensions)
+            denominator = predicted_edge.sum(dim=dimensions) + target_edge.sum(
+                dim=dimensions
+            )
+            edge_dice = 1.0 - (2.0 * intersection + 1.0) / (
+                denominator + 1.0
+            )
+            return mask_loss + 0.1 * (edge_bce + edge_dice.mean())
     if not deep_supervision:
         return segmentation_loss(name, outputs[0], target)
     weights = (1.0, 0.4, 0.2, 0.1)
