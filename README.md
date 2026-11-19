@@ -836,15 +836,69 @@ with unlabeled images, four-view TTA, batch size 4, and at most 10 epochs per
 fold. It is an exploratory, shorter run than the documented 30-epoch command.
 The first two outer folds are complete:
 
-| Fold | Dice | TTA Dice | mIoU | Sensitivity | Specificity | AP50 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.8861 | 0.8920 | 0.8182 | 0.9095 | 0.9792 | 0.8742 |
-| 2 | 0.8726 | 0.8877 | 0.8010 | 0.9097 | 0.9719 | 0.8546 |
+All five outer folds completed and were scored once on their held-out images.
+Mean +/- sample standard deviation across folds:
 
-These are interim per-fold results, not a five-fold estimate or evidence of a
-gain over a matched supervised control. Fold 3 is in progress; the run will
-resume from saved epoch checkpoints if interrupted. Do not treat these partial
-results as final.
+| Metric | Ordinary | Four-view TTA |
+|---|---:|---:|
+| Dice | 0.8786 +/- 0.0105 | 0.8869 +/- 0.0114 |
+| mIoU | 0.8085 +/- 0.0138 | 0.8199 +/- 0.0153 |
+| Sensitivity | 0.9133 +/- 0.0123 | 0.9212 +/- 0.0145 |
+| Specificity | 0.9740 +/- 0.0040 | 0.9757 +/- 0.0034 |
+| AP50 | 0.8600 +/- 0.0138 | 0.8678 +/- 0.0252 |
+| Bounding-box precision | 0.7585 +/- 0.0126 | 0.8046 +/- 0.0380 |
+| Bounding-box recall | 0.8760 +/- 0.0148 | 0.8818 +/- 0.0237 |
+| FPS | 36.9 +/- 13.4 | 10.1 +/- 3.6 |
+
+The frequency-fusion Swin hybrid has 49.78M parameters and approximately
+23.86 GFLOPs per 352 x 352 image by THOP.
+
+| Fold | Dice | TTA Dice |
+|---:|---:|---:|
+| 1 | 0.8861 | 0.8920 |
+| 2 | 0.8726 | 0.8877 |
+| 3 | 0.8928 | 0.9020 |
+| 4 | 0.8740 | 0.8811 |
+| 5 | 0.8673 | 0.8718 |
+
+The small-box subgroup (13 images with annotated box area <=2% of the frame)
+scored Dice 0.5327 +/- 0.2913, rising to 0.5630 +/- 0.2734 with TTA. This
+small subgroup has high variability and demonstrates the persistent small-lesion
+failure mode. TTA improves the fold-mean Dice by 0.0084 at roughly 3.7x lower
+inference throughput. DataLoader worker processes failed because the system
+paging file was insufficient, so the reproducible resume command uses
+`--num-workers 0`.
+
+### Matched supervised ablation
+
+A second, matched five-fold control was run with the same model, loss, folds,
+seed, preprocessing, image size, pretrained encoders, batch size, and 10-epoch
+cap, but without the EMA consistency term or unlabeled images. Mean +/- sample
+standard deviation:
+
+| Training condition | Dice | TTA Dice | Sensitivity | Specificity | AP50 |
+|---|---:|---:|---:|---:|---:|
+| Supervised only | 0.8747 +/- 0.0082 | 0.8839 +/- 0.0055 | 0.8877 +/- 0.0384 | 0.9764 +/- 0.0119 | 0.8555 +/- 0.0116 |
+| EMA + unlabeled consistency | 0.8786 +/- 0.0105 | 0.8869 +/- 0.0114 | 0.9133 +/- 0.0123 | 0.9740 +/- 0.0040 | 0.8600 +/- 0.0138 |
+| Paired fold delta (EMA - supervised) | +0.0039 +/- 0.0128 | +0.0030 +/- 0.0136 | - | - | - |
+
+The EMA-plus-unlabeled condition improved ordinary Dice in 4/5 folds and TTA
+Dice in 3/5. It had better fold-mean sensitivity, but slightly lower mean
+specificity. This is a modest, noisy result and does not establish a
+statistically significant gain. The EMA arm includes consistency on labeled
+training views as well as pseudo-label consistency on unlabeled images; this
+two-arm comparison does not isolate the unlabeled-image contribution from the
+EMA regularizer. The TTA small-box Dice was lower for the EMA arm
+(0.5630 +/- 0.2734) than the supervised control (0.6788 +/- 0.2817), so this
+pilot does not support a small-lesion benefit. The 0.93-0.95 target was not
+reached.
+
+The comparison report and plotted summary are
+[benchmark_comparison.csv](reports/hyperkvasir_comparison/benchmark_comparison.csv),
+[subgroup_comparison.csv](reports/hyperkvasir_comparison/subgroup_comparison.csv),
+and [ablation_and_model_comparison.png](reports/hyperkvasir_comparison/ablation_and_model_comparison.png).
+The pilot-only metrics are also preserved under
+[reports/hyperkvasir_pilot10/](reports/hyperkvasir_pilot10).
 
 Run or resume this exact pilot configuration:
 
@@ -861,13 +915,46 @@ python -m polyp_pipeline train `
   --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\clinic_test" `
   --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\colon_test" `
   --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\etis_test" `
-  --test-time-augmentation --device cuda --num-workers 2 `
+  --test-time-augmentation --device cuda --num-workers 0 `
   --no-overlays --no-predictions
 ```
 
 The command is resumable: rerun it with the same arguments after interruption.
 Epoch checkpoints, fold results, and the unlabeled-image exclusion manifest
 remain in the output directory outside Git.
+
+External evaluation was run only after all five Kvasir checkpoints completed.
+The same fixed external images are scored by each of the five Kvasir fold
+models, so the standard deviation reflects model/fold variation, not sampling
+variation among independent external cohorts. Dice is mean +/- sample SD across
+the five fold-specific models:
+
+| Held-out dataset | Images | Dice | TTA Dice | mIoU | Sensitivity | AP50 |
+|---|---:|---:|---:|---:|---:|---:|
+| ClinicDB | 62 | 0.7455 +/- 0.0230 | 0.7637 +/- 0.0180 | 0.6557 | 0.7647 | 0.7228 |
+| ColonDB | 380 | 0.6886 +/- 0.0195 | 0.6857 +/- 0.0180 | 0.5934 | 0.6676 | 0.6698 |
+| ETIS-LaribPolypDB | 196 | 0.6218 +/- 0.0417 | 0.6307 +/- 0.0417 | 0.5300 | 0.8729 | 0.5913 |
+
+TTA did not improve ColonDB Dice. The external data roots contained 34
+within-dataset exact duplicate pairs in ColonDB and 3 in ETIS; those cases were
+retained and the duplicate counts are recorded in `external_eval_config.json`,
+so these scores are not fully independent across images. None of the external
+images had an exact decoded-pixel match in the downloaded unlabeled pool.
+External results are research estimates, not clinical validation.
+Fold-by-fold results and duplicate metadata are saved in
+[external_test_comparison.csv](reports/hyperkvasir_comparison/external_test_comparison.csv)
+and the run-local `external_eval_config.json`.
+
+Reproduce the external evaluation after training:
+
+```powershell
+python -m polyp_pipeline external-evaluate `
+  --input-dir "D:\PolypRuns\edge_boundary_hyperkvasir_pilot10" `
+  --external-test-dataset-root "D:\PolypDatasets\prepared\clinic_test" `
+  --external-test-dataset-root "D:\PolypDatasets\prepared\colon_test" `
+  --external-test-dataset-root "D:\PolypDatasets\prepared\etis_test" `
+  --batch-size 2 --device cuda --num-workers 0
+```
 
 ## Pipeline details
 
@@ -1154,8 +1241,10 @@ plots are kept under `reports/full_benchmark/`.
 - HarDNet-MSEG, Polyp-PVT, and MedSAM 2 were not included. SegFormer and
   UPerNet are general transformer segmentation architectures, not substitutes
   for those polyp-specific or foundation-model implementations.
-- There is no independent external dataset, normal-patient control set, or
-  clinical validation.
+- ClinicDB, ColonDB, and ETIS were evaluated as held-out external sets for the
+  completed EMA/unlabeled pilot, but are not independent clinical cohorts;
+  ColonDB and ETIS include within-dataset exact duplicate pairs. There is no
+  normal-patient control set or clinical validation.
 - The sessile and small-box subgroup comparisons are descriptive; subgroup
   counts and overlap are stated above.
 - The probability threshold is fixed at 0.5. Scores are not probability-
