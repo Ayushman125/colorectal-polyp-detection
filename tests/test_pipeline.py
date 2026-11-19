@@ -3,20 +3,33 @@ from __future__ import annotations
 import csv
 import json
 import hashlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from zipfile import ZipFile
+from unittest.mock import patch
 
 import cv2
 import numpy as np
+import torch
 
 import polyp_pipeline.dataset_prep as dataset_prep
+import polyp_pipeline.hyperkvasir as hyperkvasir
 from polyp_pipeline.data import (
     Case,
     NonSingletonBatchSampler,
+    UnlabeledImageDataset,
     create_outer_folds,
     discover_cases,
+    discover_unlabeled_images,
+)
+from polyp_pipeline.deep import (
+    _filter_unlabeled_images,
+    _image_content_hash,
+    _uncertainty_pseudo_label_loss,
+    evaluate_external_sets,
+    train_cross_validation,
 )
 from polyp_pipeline.features import extract_patch_features, label_patches
 from polyp_pipeline.metrics import (
@@ -26,7 +39,6 @@ from polyp_pipeline.metrics import (
     segmentation_metrics,
 )
 from polyp_pipeline.report import generate_report
-from unittest.mock import patch
 
 
 class DatasetTests(unittest.TestCase):
@@ -149,6 +161,311 @@ class DatasetTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "do not match"):
                 discover_cases(root)
 
+    def test_unlabeled_images_are_deduplicated_against_protected_cohorts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            train_root = root / "train"
+            eval_root = root / "evaluation"
+            unlabeled_root = root / "unlabeled"
+            for dataset_root in (train_root, eval_root):
+                (dataset_root / "images").mkdir(parents=True)
+                (dataset_root / "masks").mkdir()
+            unlabeled_root.mkdir()
+
+            training_image = np.full((16, 16, 3), 25, dtype=np.uint8)
+            evaluation_image = np.full((16, 16, 3), 75, dtype=np.uint8)
+            unique_image = np.full((16, 16, 3), 125, dtype=np.uint8)
+            second_unique_image = np.full((16, 16, 3), 175, dtype=np.uint8)
+            training_mask = np.zeros((16, 16), dtype=np.uint8)
+            for dataset_root, image, case_name in (
+                (train_root, training_image, "train"),
+                (eval_root, evaluation_image, "eval"),
+            ):
+                cv2.imwrite(
+                    str(dataset_root / "images" / f"{case_name}.png"), image
+                )
+                cv2.imwrite(
+                    str(dataset_root / "masks" / f"{case_name}.png"),
+                    training_mask,
+                )
+            cv2.imwrite(str(unlabeled_root / "train_copy.png"), training_image)
+            cv2.imwrite(str(unlabeled_root / "eval_copy.png"), evaluation_image)
+            cv2.imwrite(str(unlabeled_root / "unique.png"), unique_image)
+            cv2.imwrite(str(unlabeled_root / "unique_copy.png"), unique_image)
+            cv2.imwrite(str(unlabeled_root / "second_unique.png"), second_unique_image)
+            paths = discover_unlabeled_images(unlabeled_root)
+            protected_cases = [
+                *discover_cases(train_root),
+                *discover_cases(eval_root),
+            ]
+
+            eligible, manifest, config = _filter_unlabeled_images(
+                paths,
+                unlabeled_root,
+                protected_cases,
+                protected_cases[1:],
+            )
+
+            self.assertEqual(
+                [path.name for path in eligible], ["second_unique.png", "unique.png"]
+            )
+            self.assertEqual(config["eligible_image_count"], 2)
+            self.assertEqual(
+                sum(entry["status"] == "excluded" for entry in manifest), 3
+            )
+            self.assertEqual(
+                config["excluded_evaluation_roots"], [str(eval_root.resolve())]
+            )
+
+    def test_unlabeled_dataset_returns_normalized_image_tensor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            image_path = Path(temporary_directory) / "image.png"
+            image = np.full((48, 64, 3), 100, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), image))
+
+            tensor = UnlabeledImageDataset(
+                [image_path],
+                size=32,
+                preprocessing="raw",
+                augment=False,
+            )[0]
+
+            self.assertEqual(tuple(tensor.shape), (3, 32, 32))
+            self.assertGreater(float(tensor.min()), 0.0)
+            self.assertLess(float(tensor.max()), 1.0)
+
+
+class SemiSupervisedTests(unittest.TestCase):
+    def test_cross_validation_trains_and_checkpoints_with_unlabeled_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cases = []
+            for index in range(4):
+                image_path = root / f"case_{index}.png"
+                mask_path = root / f"mask_{index}.png"
+                image = np.full((32, 32, 3), 20 + index * 20, dtype=np.uint8)
+                mask = np.zeros((32, 32), dtype=np.uint8)
+                mask[8:24, 8:24] = 255
+                cv2.imwrite(str(image_path), image)
+                cv2.imwrite(str(mask_path), mask)
+                cases.append(Case(f"case_{index}", image_path, mask_path))
+            unlabeled_root = root / "unlabeled"
+            unlabeled_root.mkdir()
+            unlabeled_paths = []
+            for index in range(4):
+                image_path = unlabeled_root / f"unlabeled_{index}.png"
+                image = np.full((32, 32, 3), 120 + index * 20, dtype=np.uint8)
+                cv2.imwrite(str(image_path), image)
+                unlabeled_paths.append(image_path)
+            output_dir = root / "run"
+
+            with (
+                patch(
+                    "polyp_pipeline.deep.build_model",
+                    side_effect=lambda *args, **kwargs: torch.nn.Conv2d(3, 1, 1),
+                ),
+                patch("polyp_pipeline.deep._model_complexity", return_value=(0.0, 0.0)),
+            ):
+                results = train_cross_validation(
+                    cases,
+                    output_dir,
+                    model_name="unet_resnet34",
+                    preprocessing="raw",
+                    n_splits=2,
+                    image_size=32,
+                    batch_size=2,
+                    epochs=1,
+                    patience=1,
+                    device_name="cpu",
+                    overlays=False,
+                    write_predictions=False,
+                    consistency_weight=0.1,
+                    unlabeled_image_paths=unlabeled_paths,
+                    unlabeled_image_dir=unlabeled_root,
+                )
+
+            run_config = json.loads(
+                (output_dir / "run_config.json").read_text(encoding="utf-8")
+            )
+            manifest = json.loads(
+                (output_dir / "unlabeled_data_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            checkpoint_exists = (
+                output_dir / "fold_1" / "latest_training.pt"
+            ).is_file()
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            run_config["unlabeled_dataset"]["eligible_image_count"], 4
+        )
+        self.assertEqual(
+            sum(entry["status"] == "included" for entry in manifest["images"]), 4
+        )
+        self.assertTrue(checkpoint_exists)
+
+    def test_external_evaluation_rejects_unlabeled_training_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            experiment_dir = root / "experiment"
+            dataset_root = root / "external"
+            (experiment_dir).mkdir()
+            (dataset_root / "images").mkdir(parents=True)
+            (dataset_root / "masks").mkdir()
+            image_path = dataset_root / "images" / "same.png"
+            mask_path = dataset_root / "masks" / "same.png"
+            image = np.full((16, 16, 3), 90, dtype=np.uint8)
+            mask = np.zeros((16, 16), dtype=np.uint8)
+            cv2.imwrite(str(image_path), image)
+            cv2.imwrite(str(mask_path), mask)
+            case = Case("external_same", image_path, mask_path)
+            image_hash = _image_content_hash(case)
+            (experiment_dir / "run_config.json").write_text(
+                json.dumps(
+                    {
+                        "model": "unet_resnet34",
+                        "preprocessing": "raw",
+                        "image_size": 32,
+                        "folds": 2,
+                        "unlabeled_dataset": {
+                            "eligible_manifest_sha256": "manifest-hash"
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (experiment_dir / "unlabeled_data_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "images": [
+                            {
+                                "decoded_image_sha256": image_hash,
+                                "status": "included",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "overlap the unlabeled"):
+                evaluate_external_sets(
+                    experiment_dir,
+                    {"external": [case]},
+                    device_name="cpu",
+                )
+
+    def test_uncertainty_pseudo_label_loss_ignores_uncertain_teacher_pixels(self) -> None:
+        student_logits = torch.zeros((1, 1, 4, 4), requires_grad=True)
+        teacher_logits = torch.zeros_like(student_logits)
+
+        loss = _uncertainty_pseudo_label_loss(student_logits, teacher_logits)
+
+        self.assertEqual(float(loss), 0.0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(student_logits.grad).all())
+        self.assertEqual(float(student_logits.grad.abs().sum()), 0.0)
+
+    def test_uncertainty_pseudo_label_loss_trains_on_confident_teacher_pixels(self) -> None:
+        student_logits = torch.full((1, 1, 4, 4), -3.0, requires_grad=True)
+        teacher_logits = torch.full((1, 1, 4, 4), 3.0)
+
+        loss = _uncertainty_pseudo_label_loss(student_logits, teacher_logits)
+
+        self.assertGreater(float(loss), 0.0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(student_logits.grad).all())
+        self.assertLess(float(student_logits.grad.sum()), 0.0)
+
+    def test_hyperkvasir_download_selects_and_verifies_a_seeded_sample(self) -> None:
+        contents = {
+            "first.jpg": b"first image bytes",
+            "second.jpg": b"second image bytes",
+            "third.jpg": b"third image bytes",
+            "empty.jpg": b"",
+        }
+
+        def item(name: str, index: int) -> dict[str, object]:
+            content = contents[name]
+            return {
+                "id": f"osf-{index}",
+                "attributes": {
+                    "name": name,
+                    "kind": "file",
+                    "size": len(content),
+                    "extra": {"hashes": {"sha256": hashlib.sha256(content).hexdigest()}},
+                },
+                "links": {"download": f"https://example.test/{name}"},
+            }
+
+        first_page = {
+            "data": [
+                item("first.jpg", 1),
+                item("second.jpg", 2),
+                item("empty.jpg", 4),
+            ],
+            "links": {"next": "https://example.test/page/2"},
+        }
+        second_page = {
+            "data": [item("third.jpg", 3)],
+            "links": {"next": None},
+        }
+
+        def open_file(request: object, timeout: int) -> io.BytesIO:
+            url = request.full_url
+            return io.BytesIO(contents[Path(url).name])
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with (
+                patch.object(
+                    hyperkvasir,
+                    "_read_json",
+                    side_effect=[first_page, second_page],
+                ),
+                patch.object(hyperkvasir.urllib.request, "urlopen", side_effect=open_file),
+            ):
+                result = hyperkvasir.download_hyperkvasir_unlabeled(
+                    Path(temporary_directory),
+                    max_images=2,
+                    seed=12,
+                    workers=2,
+                )
+            with (
+                patch.object(
+                    hyperkvasir,
+                    "_read_json",
+                    side_effect=[first_page, second_page],
+                ),
+                patch.object(
+                    hyperkvasir.urllib.request,
+                    "urlopen",
+                    side_effect=AssertionError("verified files should be reused"),
+                ),
+            ):
+                resumed_result = hyperkvasir.download_hyperkvasir_unlabeled(
+                    Path(temporary_directory),
+                    max_images=2,
+                    seed=12,
+                    workers=2,
+                )
+            manifest = json.loads(
+                (Path(temporary_directory) / "download_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(result["available_image_count"], 3)
+        self.assertEqual(result["downloaded_image_count"], 2)
+        self.assertEqual(resumed_result["downloaded_image_count"], 2)
+        self.assertEqual(len(manifest["images"]), 2)
+        self.assertTrue(
+            all(
+                record["status"] == "verified_existing"
+                for record in manifest["images"]
+            )
+        )
+
     def test_external_dataset_cases_receive_a_source_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -244,13 +561,33 @@ class FeatureAndMetricTests(unittest.TestCase):
 
         targets = torch.zeros(2, 1, 32, 32)
         targets[:, :, 8:24, 8:24] = 1.0
-        for loss_name in ("focal_tversky", "dice_boundary", "bce_dice_boundary"):
+        for loss_name in (
+            "focal_tversky",
+            "dice_boundary",
+            "bce_dice_boundary",
+            "bce_dice_edge_boundary",
+        ):
             logits = torch.zeros_like(targets, requires_grad=True)
             loss = segmentation_loss(loss_name, logits, targets)
             self.assertTrue(torch.isfinite(loss).item())
             loss.backward()
             self.assertIsNotNone(logits.grad)
             self.assertTrue(torch.isfinite(logits.grad).all().item())
+
+    def test_edge_boundary_loss_is_safe_inside_mixed_precision_autocast(self) -> None:
+        from polyp_pipeline.models import segmentation_loss
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        autocast_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+        logits = torch.randn(2, 1, 32, 32, device=device, requires_grad=True)
+        targets = torch.zeros_like(logits)
+        targets[:, :, 8:24, 8:24] = 1.0
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+            loss = segmentation_loss("bce_dice_edge_boundary", logits, targets)
+
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss).item())
+        self.assertTrue(torch.isfinite(logits.grad).all().item())
 
     def test_transformer_models_return_full_resolution_logits(self) -> None:
         import torch

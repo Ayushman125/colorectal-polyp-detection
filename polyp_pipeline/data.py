@@ -126,6 +126,20 @@ def discover_cases(dataset_root: Path, case_id_prefix: str | None = None) -> lis
     return cases
 
 
+def discover_unlabeled_images(image_root: Path) -> list[Path]:
+    if not image_root.is_dir():
+        raise FileNotFoundError(f"Unlabeled image directory does not exist: {image_root}")
+    supported_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    image_paths = sorted(
+        path
+        for path in image_root.rglob("*")
+        if path.is_file() and path.suffix.lower() in supported_extensions
+    )
+    if not image_paths:
+        raise ValueError(f"No supported unlabeled images found in {image_root}")
+    return image_paths
+
+
 def create_outer_folds(
     cases: list[Case], n_splits: int = 5, seed: int = 42
 ) -> list[dict[str, list[str]]]:
@@ -325,3 +339,60 @@ class KvasirDataset(Dataset[tuple[torch.Tensor, torch.Tensor, str]]):
             image_tensor = (image_tensor - mean) / standard_deviation
         mask_tensor = torch.from_numpy(mask[None, ...].copy()).float()
         return image_tensor, mask_tensor, case.case_id
+
+
+class UnlabeledImageDataset(Dataset[torch.Tensor]):
+    def __init__(
+        self,
+        image_paths: list[Path],
+        size: int = 352,
+        preprocessing: str = "clahe",
+        augment: bool = True,
+        imagenet_normalize: bool = False,
+    ) -> None:
+        if not image_paths:
+            raise ValueError("At least one unlabeled image is required")
+        if size < 32:
+            raise ValueError("size must be at least 32 pixels")
+        self.image_paths = image_paths
+        self.size = size
+        self.preprocessing = preprocessing
+        self.augment = augment
+        self.imagenet_normalize = imagenet_normalize
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        image_path = self.image_paths[index]
+        bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise OSError(f"Could not read unlabeled image: {image_path}")
+        image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        image = _preprocess_image(
+            image,
+            self.preprocessing,
+            self.preprocessing == "clahe",
+        )
+        image = cv2.resize(image, (self.size, self.size), interpolation=cv2.INTER_AREA)
+        if self.augment:
+            if random.random() < 0.5:
+                image = cv2.flip(image, 1)
+            if random.random() < 0.5:
+                image = cv2.flip(image, 0)
+            turns = random.randrange(4)
+            if turns:
+                image = np.ascontiguousarray(np.rot90(image, turns))
+
+        image_tensor = torch.from_numpy(
+            np.ascontiguousarray(image.transpose(2, 0, 1))
+        ).float() / 255.0
+        if self.imagenet_normalize:
+            mean = torch.tensor((0.485, 0.456, 0.406), dtype=image_tensor.dtype)[
+                :, None, None
+            ]
+            standard_deviation = torch.tensor(
+                (0.229, 0.224, 0.225), dtype=image_tensor.dtype
+            )[:, None, None]
+            image_tensor = (image_tensor - mean) / standard_deviation
+        return image_tensor

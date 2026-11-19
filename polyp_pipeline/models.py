@@ -187,6 +187,64 @@ def bce_dice_boundary_loss(
     return bce + dice_loss.mean() + boundary_weight * boundary
 
 
+def bce_dice_edge_boundary_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    boundary_weight: float = 0.1,
+    edge_weight: float = 0.1,
+) -> torch.Tensor:
+    if not np.isfinite(boundary_weight) or boundary_weight < 0:
+        raise ValueError("boundary_weight must be finite and non-negative")
+    if not np.isfinite(edge_weight) or edge_weight < 0:
+        raise ValueError("edge_weight must be finite and non-negative")
+    with torch.autocast(device_type=logits.device.type, enabled=False):
+        logits_float = logits.float()
+        target_float = target.float()
+        probabilities = torch.sigmoid(logits_float)
+        bce = nn.functional.binary_cross_entropy_with_logits(
+            logits_float, target_float
+        )
+        dimensions = (1, 2, 3)
+        intersection = (probabilities * target_float).sum(dim=dimensions)
+        denominator = probabilities.sum(dim=dimensions) + target_float.sum(
+            dim=dimensions
+        )
+        dice_loss = 1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
+        signed_distance = _signed_distance_map(target, probabilities)
+        distance_loss = (probabilities * signed_distance).mean()
+
+        target_edge = (
+            nn.functional.max_pool2d(target_float, kernel_size=3, stride=1, padding=1)
+            + nn.functional.max_pool2d(
+                -target_float, kernel_size=3, stride=1, padding=1
+            )
+        ).clamp_(0.0, 1.0)
+        predicted_edge = (
+            nn.functional.max_pool2d(
+                probabilities, kernel_size=3, stride=1, padding=1
+            )
+            + nn.functional.max_pool2d(
+                -probabilities, kernel_size=3, stride=1, padding=1
+            )
+        ).clamp(0.0, 1.0)
+        edge_bce = nn.functional.binary_cross_entropy(
+            predicted_edge.clamp(1e-6, 1.0 - 1e-6), target_edge
+        )
+        edge_intersection = (predicted_edge * target_edge).sum(dim=dimensions)
+        edge_denominator = predicted_edge.sum(dim=dimensions) + target_edge.sum(
+            dim=dimensions
+        )
+        edge_dice_loss = 1.0 - (2.0 * edge_intersection + 1.0) / (
+            edge_denominator + 1.0
+        )
+        return (
+            bce
+            + dice_loss.mean()
+            + boundary_weight * distance_loss
+            + edge_weight * (edge_bce + edge_dice_loss.mean())
+        )
+
+
 def segmentation_loss(name: str, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     if name == "bce":
         return nn.functional.binary_cross_entropy_with_logits(logits, target)
@@ -200,6 +258,8 @@ def segmentation_loss(name: str, logits: torch.Tensor, target: torch.Tensor) -> 
         return dice_boundary_loss(logits, target)
     if name == "bce_dice_boundary":
         return bce_dice_boundary_loss(logits, target)
+    if name == "bce_dice_edge_boundary":
+        return bce_dice_edge_boundary_loss(logits, target)
     raise ValueError(f"Unsupported loss: {name}")
 
 

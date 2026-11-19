@@ -17,7 +17,7 @@ The implementation focuses on the core AI engine: polyp segmentation, mask-
 derived localization, and feature characterization. It does not implement a
 telemedicine workflow, patient management, or clinical deployment.
 
-The complete executed matrix contains **13 experiments**:
+The previously completed baseline matrix contains **13 experiments**:
 
 - One classical experiment containing Random Forest and RBF-SVM patch
   classifiers.
@@ -710,6 +710,164 @@ Joint-dataset or domain-adaptation checkpoints are separate previous results,
 not mixed into this table. The 0.93-0.95 target was not reached in this
 Kvasir-only study. External results remain substantially lower than Kvasir
 performance and must not be presented as clinical validation.
+
+### Explicit morphological edge supervision
+
+The train command also provides `bce_dice_edge_boundary` for a controlled
+edge-aware extension to the existing signed-distance objective. Given a binary
+mask `y`, its 3 x 3 morphological gradient is
+`E(y) = max_pool(y) - min_pool(y)`, implemented as
+`max_pool(y) + max_pool(-y)`. The model's soft edge map is the same operation
+applied to its sigmoid probabilities `p`. The added loss is
+`L_edge = BCE(E(p), E(y)) + (1 - Dice(E(p), E(y)))`, and the full objective is
+`L = BCE(z,y) + (1 - Dice(p,y)) + 0.1 mean(p d) + 0.1 L_edge`, where `d` is the
+normalized signed distance map described above. This is a differentiable
+morphological edge penalty, not a Canny edge detector or a Hausdorff-distance
+implementation. Ground-truth edge maps are constructed from each supervised
+training mask only.
+
+Run the new loss on the pretrained Swin/Haar hybrid with five-fold CV, EMA
+consistency, and TTA:
+
+```powershell
+python -m polyp_pipeline train `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "D:\PolypRuns\edge_boundary_ema" `
+  --model transfuse_frequency_swin_tiny `
+  --loss bce_dice_edge_boundary `
+  --folds 5 --seed 42 --size 352 `
+  --batch-size 2 --epochs 30 --patience 6 `
+  --pretrained-encoder --consistency-weight 0.1 `
+  --ema-decay 0.99 --consistency-rampup-epochs 5 `
+  --test-time-augmentation --device cuda --no-overlays
+```
+
+The edge-loss arm is a separate condition from the earlier Haar study. Its
+performance must be recorded from its own outer-fold metrics, not inferred from
+the prior study.
+
+## Genuine unlabeled-data training
+
+The pipeline can download HyperKvasir's image-only corpus from its public OSF
+folder. The downloader samples from seeded, randomly selected pages spread
+across the published listing, verifies each downloaded file against its
+published SHA-256 and size, and writes a `download_manifest.json`. It defaults
+to a reproducible 1,000-image sample; use `--all-images` for the full release
+(approximately 99,000 published entries / 29.4 GB). Zero-byte OSF placeholder
+records are excluded; the manifest distinguishes the published listing count
+from the usable sample count.
+
+```powershell
+python -m polyp_pipeline download-hyperkvasir `
+  --output-dir "D:\PolypDatasets\HyperKvasir\unlabeled_clean" `
+  --max-images 1000 --seed 42 --workers 8
+```
+
+HyperKvasir is licensed CC BY 4.0. Cite Borgli et al., *HyperKvasir, a
+comprehensive multi-class image and video dataset for gastrointestinal
+endoscopy*, Scientific Data 7, 283 (2020), DOI
+[10.1038/s41597-020-00622-y](https://doi.org/10.1038/s41597-020-00622-y).
+The images are a research dataset, not clinical evidence.
+The unlabeled collection spans gastrointestinal endoscopy and is not guaranteed
+to contain colon-only frames; this domain mismatch is a limitation of the
+pseudo-label experiment.
+
+For each Kvasir-SEG run, the pipeline hashes the decoded pixels of every
+candidate unlabeled image and excludes exact duplicates of **all Kvasir-SEG
+cases**, including the current outer test fold, as well as duplicates within
+the unlabeled pool. Provide each held-out external cohort at training time too;
+external evaluation repeats the overlap check and refuses to score an external
+cohort if it overlaps the unlabeled training corpus:
+
+```powershell
+python -m polyp_pipeline train `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "D:\PolypRuns\edge_boundary_hyperkvasir" `
+  --model transfuse_frequency_swin_tiny `
+  --loss bce_dice_edge_boundary `
+  --folds 5 --seed 42 --size 352 `
+  --batch-size 2 --epochs 30 --patience 6 `
+  --pretrained-encoder --consistency-weight 0.1 `
+  --ema-decay 0.99 --consistency-rampup-epochs 5 `
+  --unlabeled-image-dir "D:\PolypDatasets\HyperKvasir\unlabeled_clean" `
+  --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\clinic_test" `
+  --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\colon_test" `
+  --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\etis_test" `
+  --test-time-augmentation --device cuda --no-overlays
+```
+
+The outer and inner splits remain image-disjoint. The fixed unlabeled pool is
+filtered once against every Kvasir case (not only the current fold), which
+prevents transductive exposure to any Kvasir validation/test image. Before each
+supervised batch, the EMA teacher labels a weak photometric view of an unlabeled
+image; the student receives a stronger view with the same geometry. For teacher
+probability `p`, normalized binary entropy is
+`H(p) = -[p log(p) + (1-p) log(1-p)] / log(2)`. Pixels with `p <= 0.3` or
+`p >= 0.7` receive weight `1-H(p)`; uncertain pixels are ignored. The
+unsupervised objective adds confidence-weighted pseudo-label BCE and
+probability-consistency MSE. Its weight is ramped over the first configured
+epochs and added to supervised loss. The run writes the exact deduplication
+decisions and content hashes to `unlabeled_data_manifest.json`; checkpoints
+and run configuration include the unlabeled corpus fingerprint, so an
+incompatible resume is rejected.
+
+The duplicate guard detects exact decoded-pixel matches, not resized or
+recompressed near-duplicates. It cannot certify absence of video-adjacent or
+near-duplicate frames; review dataset provenance and split definitions before
+making external generalization claims. Pass every known external test cohort
+with `--exclude-unlabeled-dataset-root`, and keep those cohorts out of all
+training and model-selection decisions.
+
+No semi-supervised performance gain is assumed. The edge-loss arm and the
+HyperKvasir pseudo-label arm must be evaluated using their saved outer-fold
+results; a target Dice score is not a guaranteed outcome.
+
+### HyperKvasir experiment status
+
+A seeded 1,000-image HyperKvasir sample was downloaded to
+`D:\PolypDatasets\HyperKvasir\unlabeled_clean`. All 1,000 image files passed
+published size/SHA-256 verification and OpenCV decoding. After exact decoded
+pixel deduplication against Kvasir-SEG and the three configured external test
+cohorts, all 1,000 remained eligible for training.
+
+The initial five-fold CUDA pilot uses the frequency-fusion Swin hybrid,
+ImageNet-pretrained encoders, CLAHE, BCE+Dice+boundary loss, EMA consistency
+with unlabeled images, four-view TTA, batch size 4, and at most 10 epochs per
+fold. It is an exploratory, shorter run than the documented 30-epoch command.
+The first two outer folds are complete:
+
+| Fold | Dice | TTA Dice | mIoU | Sensitivity | Specificity | AP50 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.8861 | 0.8920 | 0.8182 | 0.9095 | 0.9792 | 0.8742 |
+| 2 | 0.8726 | 0.8877 | 0.8010 | 0.9097 | 0.9719 | 0.8546 |
+
+These are interim per-fold results, not a five-fold estimate or evidence of a
+gain over a matched supervised control. Fold 3 is in progress; the run will
+resume from saved epoch checkpoints if interrupted. Do not treat these partial
+results as final.
+
+Run or resume this exact pilot configuration:
+
+```powershell
+python -m polyp_pipeline train `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "D:\PolypRuns\edge_boundary_hyperkvasir_pilot10" `
+  --model transfuse_frequency_swin_tiny `
+  --loss bce_dice_edge_boundary `
+  --folds 5 --seed 42 --size 352 --preprocessing clahe `
+  --batch-size 4 --epochs 10 --patience 6 --pretrained-encoder `
+  --consistency-weight 0.1 --ema-decay 0.99 --consistency-rampup-epochs 5 `
+  --unlabeled-image-dir "D:\PolypDatasets\HyperKvasir\unlabeled_clean" `
+  --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\clinic_test" `
+  --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\colon_test" `
+  --exclude-unlabeled-dataset-root "D:\PolypDatasets\prepared\etis_test" `
+  --test-time-augmentation --device cuda --num-workers 2 `
+  --no-overlays --no-predictions
+```
+
+The command is resumable: rerun it with the same arguments after interruption.
+Epoch checkpoints, fold results, and the unlabeled-image exclusion manifest
+remain in the output directory outside Git.
 
 ## Pipeline details
 

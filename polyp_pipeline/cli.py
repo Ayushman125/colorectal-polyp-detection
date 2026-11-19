@@ -7,9 +7,10 @@ from pathlib import Path
 from .advanced_benchmark import run_advanced_benchmark
 from .benchmark import read_benchmark_status, run_full_benchmark
 from .classical import run_classical_cv
-from .data import discover_cases
+from .data import discover_cases, discover_unlabeled_images
 from .dataset_prep import prepare_zenodo_datasets
 from .deep import evaluate_external_sets, train_cross_validation
+from .hyperkvasir import download_hyperkvasir_unlabeled
 from .models import MODEL_SPECS
 from .report import generate_report
 from .research_benchmark import run_frequency_boundary_benchmark
@@ -37,6 +38,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    download = commands.add_parser(
+        "download-hyperkvasir",
+        help="Download a reproducible HyperKvasir unlabeled-image sample from OSF.",
+    )
+    download.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data") / "hyperkvasir" / "unlabeled",
+    )
+    download.add_argument("--max-images", type=int, default=1000)
+    download.add_argument("--all-images", action="store_true")
+    download.add_argument("--seed", type=int, default=42)
+    download.add_argument("--workers", type=int, default=8)
+
     deep = commands.add_parser("train", help="Train/evaluate a deep model with outer K-fold CV.")
     _common_arguments(deep)
     deep.add_argument("--model", choices=tuple(MODEL_SPECS), default="unet_resnet34")
@@ -49,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
             "focal_tversky",
             "dice_boundary",
             "bce_dice_boundary",
+            "bce_dice_edge_boundary",
         ),
         default="bce_dice",
     )
@@ -65,6 +81,21 @@ def build_parser() -> argparse.ArgumentParser:
     deep.add_argument("--consistency-weight", type=float, default=0.0)
     deep.add_argument("--ema-decay", type=float, default=0.99)
     deep.add_argument("--consistency-rampup-epochs", type=int, default=5)
+    deep.add_argument(
+        "--unlabeled-image-dir",
+        type=Path,
+        help="Optional image-only corpus for uncertainty-filtered EMA pseudo-labeling.",
+    )
+    deep.add_argument(
+        "--exclude-unlabeled-dataset-root",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Paired evaluation cohort to exclude from unlabeled training by exact "
+            "decoded-image hash; repeat for each held-out cohort."
+        ),
+    )
     deep.add_argument("--no-overlays", action="store_true")
     deep.add_argument("--no-predictions", action="store_true")
 
@@ -239,6 +270,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.command == "download-hyperkvasir":
+        print(
+            json.dumps(
+                download_hyperkvasir_unlabeled(
+                    args.output_dir,
+                    max_images=None if args.all_images else args.max_images,
+                    seed=args.seed,
+                    workers=args.workers,
+                ),
+                indent=2,
+            )
+        )
+        return
     if args.command == "report":
         print(generate_report(args.input_dir or Path("runs"), args.output_dir))
         return
@@ -295,10 +339,31 @@ def main() -> None:
     cases = discover_cases(args.dataset_root)
     print(f"Found {len(cases)} paired Kvasir-SEG images in {args.dataset_root}")
     if args.command == "train":
+        unlabeled_image_paths = (
+            discover_unlabeled_images(args.unlabeled_image_dir)
+            if args.unlabeled_image_dir is not None
+            else None
+        )
+        if args.exclude_unlabeled_dataset_root and unlabeled_image_paths is None:
+            raise ValueError(
+                "--exclude-unlabeled-dataset-root requires --unlabeled-image-dir."
+            )
+        unlabeled_exclusion_cases = [
+            case
+            for index, dataset_root in enumerate(
+                args.exclude_unlabeled_dataset_root, start=1
+            )
+            for case in discover_cases(
+                dataset_root,
+                case_id_prefix=f"unlabeled_exclude{index}_{dataset_root.name}",
+            )
+        ]
         output_dir = args.output_dir / (
             f"{args.model}_{args.loss}_{args.preprocessing}"
             f"{'_imagenet' if args.pretrained_encoder else ''}"
             f"{'_tta' if args.test_time_augmentation else ''}"
+            f"{'_semisup' if unlabeled_image_paths is not None else ''}"
+            f"{'_ema' if unlabeled_image_paths is None and args.consistency_weight > 0 else ''}"
         )
         train_cross_validation(
             cases,
@@ -324,6 +389,9 @@ def main() -> None:
             ema_decay=args.ema_decay,
             consistency_rampup_epochs=args.consistency_rampup_epochs,
             write_predictions=not args.no_predictions,
+            unlabeled_image_paths=unlabeled_image_paths,
+            unlabeled_image_dir=args.unlabeled_image_dir,
+            unlabeled_exclusion_cases=unlabeled_exclusion_cases,
         )
     elif args.command == "classical":
         output_dir = args.output_dir / f"classical_{args.preprocessing}"

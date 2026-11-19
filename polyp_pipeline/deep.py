@@ -24,6 +24,7 @@ from .data import (
     Case,
     KvasirDataset,
     NonSingletonBatchSampler,
+    UnlabeledImageDataset,
     create_outer_folds,
     inner_train_validation_split,
     write_fold_manifest,
@@ -77,6 +78,34 @@ def _confidence_consistency_loss(
     return (squared_error * confidence).sum() / confidence.sum().clamp_min(1.0)
 
 
+def _uncertainty_pseudo_label_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    confidence_threshold: float = 0.7,
+) -> torch.Tensor:
+    teacher_probabilities = torch.sigmoid(teacher_logits.float()).detach()
+    student_probabilities = torch.sigmoid(student_logits.float())
+    epsilon = torch.finfo(teacher_probabilities.dtype).eps
+    clipped_probabilities = teacher_probabilities.clamp(epsilon, 1.0 - epsilon)
+    entropy = -(
+        clipped_probabilities * clipped_probabilities.log()
+        + (1.0 - clipped_probabilities)
+        * (1.0 - clipped_probabilities).log()
+    ) / np.log(2.0)
+    confident = (
+        (teacher_probabilities >= confidence_threshold)
+        | (teacher_probabilities <= 1.0 - confidence_threshold)
+    )
+    confidence_weights = (1.0 - entropy).clamp_min(0.0) * confident
+    pseudo_labels = (teacher_probabilities >= 0.5).to(student_probabilities.dtype)
+    pseudo_label_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        student_logits.float(), pseudo_labels, reduction="none"
+    )
+    consistency_loss = (student_probabilities - teacher_probabilities).square()
+    weighted_loss = (pseudo_label_loss + consistency_loss) * confidence_weights
+    return weighted_loss.sum() / confidence_weights.sum().clamp_min(1.0)
+
+
 @torch.no_grad()
 def _update_ema_model(
     teacher: torch.nn.Module, student: torch.nn.Module, decay: float
@@ -92,14 +121,97 @@ def _update_ema_model(
             teacher_buffer.copy_(student_buffer)
 
 
-def _image_content_hash(case: Case) -> str:
-    image = cv2.imread(str(case.image_path), cv2.IMREAD_COLOR)
+def _image_content_hash(case: Case | Path) -> str:
+    image_path = case.image_path if isinstance(case, Case) else case
+    case_id = case.case_id if isinstance(case, Case) else str(image_path)
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
-        raise OSError(f"Could not read image for case {case.case_id}")
+        raise OSError(f"Could not read image for case {case_id}")
     digest = hashlib.sha256()
     digest.update(str(image.shape).encode("ascii"))
     digest.update(np.ascontiguousarray(image).tobytes())
     return digest.hexdigest()
+
+
+def _filter_unlabeled_images(
+    image_paths: list[Path],
+    image_root: Path | None,
+    protected_cases: list[Case],
+    evaluation_cases: list[Case],
+) -> tuple[list[Path], list[dict[str, str]], dict[str, object]]:
+    if not image_paths:
+        raise ValueError("The unlabeled image directory contains no supported images.")
+    resolved_paths = sorted(path.resolve() for path in image_paths)
+    if len(resolved_paths) != len(set(resolved_paths)):
+        raise ValueError("Unlabeled image paths must be unique")
+    root = (
+        image_root.resolve()
+        if image_root is not None
+        else Path(os.path.commonpath([str(path.parent) for path in resolved_paths]))
+    )
+    protected_hashes: dict[str, str] = {}
+    for case in protected_cases:
+        protected_hashes.setdefault(
+            _image_content_hash(case), f"case:{case.case_id}"
+        )
+
+    eligible_paths: list[Path] = []
+    manifest_entries: list[dict[str, str]] = []
+    seen_unlabeled_hashes: dict[str, str] = {}
+    eligible_hashes: list[tuple[str, str]] = []
+    excluded_counts: dict[str, int] = {}
+    for image_path in resolved_paths:
+        image_hash = _image_content_hash(image_path)
+        try:
+            image_id = image_path.relative_to(root).as_posix()
+        except ValueError:
+            image_id = str(image_path)
+        reason = ""
+        if image_hash in protected_hashes:
+            reason = f"duplicate:{protected_hashes[image_hash]}"
+        elif image_hash in seen_unlabeled_hashes:
+            reason = f"duplicate:unlabeled:{seen_unlabeled_hashes[image_hash]}"
+        else:
+            seen_unlabeled_hashes[image_hash] = image_id
+            eligible_paths.append(image_path)
+            eligible_hashes.append((image_id, image_hash))
+        if reason:
+            exclusion_type = reason.split(":", 1)[0]
+            excluded_counts[exclusion_type] = excluded_counts.get(exclusion_type, 0) + 1
+        manifest_entries.append(
+            {
+                "image_id": image_id,
+                "decoded_image_sha256": image_hash,
+                "status": "excluded" if reason else "included",
+                "reason": reason,
+            }
+        )
+
+    if len(eligible_paths) < 2:
+        raise ValueError(
+            "At least two unique unlabeled images must remain after duplicate "
+            "exclusion against Kvasir-SEG and configured evaluation cohorts."
+        )
+    eligible_manifest_hash = hashlib.sha256(
+        "\n".join(f"{image_id}\t{digest}" for image_id, digest in eligible_hashes)
+        .encode("utf-8")
+    ).hexdigest()
+    dataset_config: dict[str, object] = {
+        "directory": str(root),
+        "requested_image_count": len(resolved_paths),
+        "eligible_image_count": len(eligible_paths),
+        "excluded_exact_duplicate_count": len(resolved_paths) - len(eligible_paths),
+        "excluded_by_reason": excluded_counts,
+        "eligible_manifest_sha256": eligible_manifest_hash,
+        "duplicate_check": "SHA-256 of decoded BGR pixel dimensions and bytes",
+        "excluded_evaluation_roots": sorted(
+            {
+                str(case.image_path.parent.parent.resolve())
+                for case in evaluation_cases
+            }
+        ),
+    }
+    return eligible_paths, manifest_entries, dataset_config
 
 
 def _atomic_json_write(path: Path, payload: object) -> None:
@@ -250,6 +362,32 @@ def _make_loader(
         batch_size=batch_size,
         shuffle=False,
         **loader_options,
+    )
+
+
+def _make_unlabeled_loader(
+    image_paths: list[Path],
+    size: int,
+    preprocessing: str,
+    batch_size: int,
+    workers: int,
+    imagenet_normalize: bool,
+) -> DataLoader:
+    dataset = UnlabeledImageDataset(
+        image_paths,
+        size=size,
+        preprocessing=preprocessing,
+        augment=True,
+        imagenet_normalize=imagenet_normalize,
+    )
+    return DataLoader(
+        dataset,
+        batch_sampler=NonSingletonBatchSampler(
+            len(dataset), batch_size=batch_size, shuffle=True
+        ),
+        num_workers=workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=workers > 0,
     )
 
 
@@ -553,6 +691,34 @@ def evaluate_external_sets(
     if not config_path.is_file():
         raise FileNotFoundError(f"Missing training configuration: {config_path}")
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    unlabeled_config = config.get("unlabeled_dataset")
+    unlabeled_manifest_hash: str | None = None
+    if unlabeled_config is not None:
+        manifest_path = experiment_dir / "unlabeled_data_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"Missing unlabeled-data manifest required for leakage checks: "
+                f"{manifest_path}"
+            )
+        unlabeled_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        unlabeled_manifest_hash = str(
+            unlabeled_config["eligible_manifest_sha256"]
+        )
+        training_image_hashes = {
+            entry["decoded_image_sha256"]
+            for entry in unlabeled_manifest["images"]
+            if entry["status"] == "included"
+        }
+        overlaps = [
+            {"dataset": dataset_name, "case_id": case_id}
+            for digest, (dataset_name, case_id) in image_hashes.items()
+            if digest in training_image_hashes
+        ]
+        if overlaps:
+            raise ValueError(
+                "External evaluation images overlap the unlabeled training corpus "
+                f"by exact decoded-image hash: {overlaps[:5]}"
+            )
     model_name = str(config["model"])
     preprocessing = str(config["preprocessing"])
     image_size = int(config["image_size"])
@@ -577,6 +743,8 @@ def evaluate_external_sets(
         },
         "within_dataset_exact_image_duplicate_pairs": duplicate_pairs_by_dataset,
     }
+    if unlabeled_manifest_hash is not None:
+        run_config["unlabeled_manifest_sha256"] = unlabeled_manifest_hash
     external_config_path = experiment_dir / "external_eval_config.json"
     if external_config_path.is_file():
         previous_config = json.loads(
@@ -787,6 +955,9 @@ def train_cross_validation(
     ema_decay: float = 0.99,
     consistency_rampup_epochs: int = 5,
     write_predictions: bool = True,
+    unlabeled_image_paths: list[Path] | None = None,
+    unlabeled_image_dir: Path | None = None,
+    unlabeled_exclusion_cases: list[Case] | None = None,
 ) -> list[dict[str, float | int | str]]:
     if model_name not in MODEL_SPECS:
         raise ValueError(f"Unsupported model: {model_name}")
@@ -802,6 +973,25 @@ def train_cross_validation(
         raise ValueError("ema_decay must be in [0, 1)")
     if consistency_rampup_epochs < 1:
         raise ValueError("consistency_rampup_epochs must be positive")
+    unlabeled_exclusion_cases = unlabeled_exclusion_cases or []
+    eligible_unlabeled_paths: list[Path] = []
+    unlabeled_manifest_entries: list[dict[str, str]] = []
+    unlabeled_dataset_config: dict[str, object] | None = None
+    if unlabeled_image_paths is not None:
+        if consistency_weight <= 0.0:
+            raise ValueError(
+                "Unlabeled images require --consistency-weight greater than zero."
+            )
+        (
+            eligible_unlabeled_paths,
+            unlabeled_manifest_entries,
+            unlabeled_dataset_config,
+        ) = _filter_unlabeled_images(
+            unlabeled_image_paths,
+            unlabeled_image_dir,
+            [*cases, *unlabeled_exclusion_cases],
+            unlabeled_exclusion_cases,
+        )
     auxiliary_cases = auxiliary_cases or []
     auxiliary_ids = [case.case_id for case in auxiliary_cases]
     if len(auxiliary_ids) != len(set(auxiliary_ids)):
@@ -857,10 +1047,20 @@ def train_cross_validation(
         "torch_cuda_version": torch.version.cuda,
         "opencv_version": cv2.__version__,
     }
+    if unlabeled_dataset_config is not None:
+        run_config["unlabeled_dataset"] = unlabeled_dataset_config
+        run_config["unlabeled_consistency"] = {
+            "loss": "entropy-weighted pseudo-label BCE plus probability MSE",
+            "confidence_threshold": 0.7,
+            "ema_decay": ema_decay,
+            "consistency_rampup_epochs": consistency_rampup_epochs,
+        }
     if test_time_augmentation:
         run_config["test_time_augmentation"] = True
-    if loss_name == "bce_dice_boundary":
+    if loss_name in {"bce_dice_boundary", "bce_dice_edge_boundary"}:
         run_config["boundary_weight"] = 0.1
+    if loss_name == "bce_dice_edge_boundary":
+        run_config["edge_weight"] = 0.1
     if consistency_weight > 0.0:
         run_config.update(
             consistency_weight=consistency_weight,
@@ -896,6 +1096,14 @@ def train_cross_validation(
                 "Resuming with fewer epochs is not supported; keep or increase --epochs."
             )
     _atomic_json_write(config_path, run_config)
+    if unlabeled_dataset_config is not None:
+        _atomic_json_write(
+            output_dir / "unlabeled_data_manifest.json",
+            {
+                **unlabeled_dataset_config,
+                "images": unlabeled_manifest_entries,
+            },
+        )
     by_id = _case_map(cases)
     metrics_path = output_dir / "fold_metrics.csv"
     results: list[dict[str, float | int | str]] = []
@@ -989,6 +1197,18 @@ def train_cross_validation(
             workers=num_workers,
             imagenet_normalize=pretrained_encoder,
             small_polyp_crop_probability=small_polyp_crop_probability,
+        )
+        unlabeled_loader = (
+            _make_unlabeled_loader(
+                eligible_unlabeled_paths,
+                image_size,
+                preprocessing,
+                batch_size,
+                num_workers,
+                pretrained_encoder,
+            )
+            if eligible_unlabeled_paths
+            else None
         )
         validation_loader = _make_loader(
             validation_cases,
@@ -1165,6 +1385,9 @@ def train_cross_validation(
             total_loss = 0.0
             total_supervised_loss = 0.0
             total_consistency_loss = 0.0
+            unlabeled_iterator = (
+                iter(unlabeled_loader) if unlabeled_loader is not None else None
+            )
             for images, masks, _ in train_loader:
                 images = images.to(device, non_blocking=True)
                 masks = masks.to(device, non_blocking=True)
@@ -1193,6 +1416,40 @@ def train_cross_validation(
                         consistency_loss = _confidence_consistency_loss(
                             student_logits, teacher_logits
                         )
+                        if unlabeled_iterator is not None and unlabeled_loader is not None:
+                            try:
+                                unlabeled_images = next(unlabeled_iterator)
+                            except StopIteration:
+                                unlabeled_iterator = iter(unlabeled_loader)
+                                unlabeled_images = next(unlabeled_iterator)
+                            unlabeled_images = unlabeled_images.to(
+                                device, non_blocking=True
+                            )
+                            teacher_unlabeled_images = _photometric_view(
+                                unlabeled_images, 0.025
+                            )
+                            student_unlabeled_images = _photometric_view(
+                                unlabeled_images, 0.1
+                            )
+                            with torch.no_grad(), torch.autocast(
+                                device_type=device.type, enabled=amp_enabled
+                            ):
+                                teacher_unlabeled_logits = _final_logits(
+                                    ema_model(teacher_unlabeled_images)
+                                )
+                            with torch.autocast(
+                                device_type=device.type, enabled=amp_enabled
+                            ):
+                                student_unlabeled_logits = _final_logits(
+                                    model(student_unlabeled_images)
+                                )
+                                unlabeled_loss = _uncertainty_pseudo_label_loss(
+                                    student_unlabeled_logits,
+                                    teacher_unlabeled_logits,
+                                )
+                            consistency_loss = torch.stack(
+                                (consistency_loss, unlabeled_loss)
+                            ).mean()
                         consistency_scale = min(
                             1.0, (epoch + 1) / consistency_rampup_epochs
                         )
@@ -1256,6 +1513,7 @@ def train_cross_validation(
                         "loss_name": loss_name,
                         "consistency_weight": consistency_weight,
                         "ema_decay": ema_decay if ema_model is not None else None,
+                        "unlabeled_image_count": len(eligible_unlabeled_paths),
                         "deep_supervision": deep_supervision,
                         "small_polyp_crop_probability": small_polyp_crop_probability,
                         "preprocessing": preprocessing,
