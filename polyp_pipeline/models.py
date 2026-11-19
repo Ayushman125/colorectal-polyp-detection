@@ -43,7 +43,12 @@ DEEP_SUPERVISION_MODELS = {
 
 
 def build_model(
-    name: str, pretrained_encoder: bool = False, image_size: int = 352
+    name: str,
+    pretrained_encoder: bool = False,
+    image_size: int = 352,
+    mfps_haar_frequency: bool = True,
+    mfps_global_local: bool = True,
+    mfps_edge_head: bool = True,
 ) -> nn.Module:
     """Build a real SMP segmentation model with a single foreground logit."""
     if name not in MODEL_SPECS:
@@ -53,7 +58,12 @@ def build_model(
     if name == "pranet_resnet34":
         return PraNetStyle(pretrained=pretrained_encoder)
     if name == "mfps_net":
-        return MFPSNet(pretrained=pretrained_encoder)
+        return MFPSNet(
+            pretrained=pretrained_encoder,
+            haar_frequency=mfps_haar_frequency,
+            global_local=mfps_global_local,
+            edge_head=mfps_edge_head,
+        )
     if name in {
         "transfuse_resnet34_swin_tiny",
         "transfuse_frequency_swin_tiny",
@@ -271,6 +281,7 @@ def segmentation_objective(
     outputs: torch.Tensor | tuple[torch.Tensor, ...],
     target: torch.Tensor,
     deep_supervision: bool = False,
+    edge_weight: float = 0.1,
 ) -> torch.Tensor:
     if isinstance(outputs, torch.Tensor):
         if deep_supervision:
@@ -309,7 +320,7 @@ def segmentation_objective(
             edge_dice = 1.0 - (2.0 * intersection + 1.0) / (
                 denominator + 1.0
             )
-            return mask_loss + 0.1 * (edge_bce + edge_dice.mean())
+            return mask_loss + edge_weight * (edge_bce + edge_dice.mean())
     if not deep_supervision:
         return segmentation_loss(name, outputs[0], target)
     weights = (1.0, 0.4, 0.2, 0.1)

@@ -658,6 +658,64 @@ class FeatureAndMetricTests(unittest.TestCase):
         self.assertIsNotNone(mask_logits.grad)
         self.assertIsNotNone(edge_logits.grad)
 
+    def test_mfps_components_are_independently_switchable(self) -> None:
+        import torch
+
+        from polyp_pipeline.models import build_model
+
+        control = build_model(
+            "mfps_net",
+            pretrained_encoder=False,
+            image_size=128,
+            mfps_haar_frequency=False,
+            mfps_global_local=False,
+            mfps_edge_head=False,
+        ).eval()
+        with torch.inference_mode():
+            mask_logits = control(torch.zeros(1, 3, 128, 128))
+        self.assertTrue(torch.is_tensor(mask_logits))
+        self.assertEqual(tuple(mask_logits.shape), (1, 1, 128, 128))
+
+        edge_head_only = build_model(
+            "mfps_net",
+            pretrained_encoder=False,
+            image_size=128,
+            mfps_haar_frequency=False,
+            mfps_global_local=False,
+            mfps_edge_head=True,
+        ).eval()
+        with torch.inference_mode():
+            outputs = edge_head_only(torch.zeros(1, 3, 128, 128))
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(
+            all(tuple(output.shape) == (1, 1, 128, 128) for output in outputs)
+        )
+
+    def test_mfps_edge_loss_weight_is_configurable(self) -> None:
+        import torch
+
+        from polyp_pipeline.models import segmentation_objective
+
+        targets = torch.zeros(1, 1, 32, 32)
+        targets[:, :, 8:24, 8:24] = 1.0
+        mask_logits = torch.zeros_like(targets, requires_grad=True)
+        edge_logits = torch.zeros_like(targets, requires_grad=True)
+        unweighted = segmentation_objective(
+            "bce_dice_edge_boundary",
+            (mask_logits, edge_logits),
+            targets,
+            False,
+            edge_weight=0.0,
+        )
+        weighted = segmentation_objective(
+            "bce_dice_edge_boundary",
+            (mask_logits, edge_logits),
+            targets,
+            False,
+            edge_weight=0.2,
+        )
+        self.assertGreater(float(weighted), float(unweighted))
+
     def test_deep_supervision_objective_backpropagates_through_auxiliary_heads(self) -> None:
         import torch
 

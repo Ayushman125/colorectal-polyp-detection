@@ -319,7 +319,13 @@ class GlobalLocalFusion(nn.Module):
 class MFPSNet(nn.Module):
     """Frequency-aware FPN-style ResNet-34 segmentation network."""
 
-    def __init__(self, pretrained: bool = True) -> None:
+    def __init__(
+        self,
+        pretrained: bool = True,
+        haar_frequency: bool = True,
+        global_local: bool = True,
+        edge_head: bool = True,
+    ) -> None:
         super().__init__()
         try:
             import segmentation_models_pytorch as smp
@@ -346,10 +352,15 @@ class MFPSNet(nn.Module):
         )
         self.frequency_fusion = nn.ModuleList(
             LearnableHaarFrequencyFusion(decoder_width)
+            if haar_frequency
+            else nn.Identity()
             for _ in range(4)
         )
         self.global_local = nn.ModuleList(
-            GlobalLocalFusion(decoder_width) for _ in range(4)
+            GlobalLocalFusion(decoder_width)
+            if global_local
+            else nn.Identity()
+            for _ in range(4)
         )
         self.decoder_blocks = nn.ModuleList(
             _conv_block(decoder_width * 2, decoder_width)
@@ -366,7 +377,8 @@ class MFPSNet(nn.Module):
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 1, kernel_size=1),
-        )
+        ) if edge_head else nn.Identity()
+        self.edge_head_enabled = edge_head
 
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.encoder(image)
@@ -403,6 +415,8 @@ class MFPSNet(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
+        if not self.edge_head_enabled:
+            return mask_logits
         edge_logits = F.interpolate(
             self.edge_head(decoded),
             size=image.shape[-2:],

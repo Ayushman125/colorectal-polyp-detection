@@ -726,6 +726,9 @@ def evaluate_external_sets(
     folds = int(config["folds"])
     pretrained_encoder = bool(config.get("pretrained_encoder", False))
     use_tta = bool(config.get("test_time_augmentation", False))
+    mfps_haar_frequency = bool(config.get("mfps_haar_frequency", True))
+    mfps_global_local = bool(config.get("mfps_global_local", True))
+    mfps_edge_head = bool(config.get("mfps_edge_head", True))
     run_config = {
         "experiment": str(experiment_dir.resolve()),
         "model": model_name,
@@ -737,6 +740,9 @@ def evaluate_external_sets(
         "device": device_name,
         "num_workers": num_workers,
         "dense_crf": dense_crf,
+        "mfps_haar_frequency": mfps_haar_frequency,
+        "mfps_global_local": mfps_global_local,
+        "mfps_edge_head": mfps_edge_head,
         "external_test_case_ids": {
             name: sorted(case.case_id for case in cases)
             for name, cases in sorted(external_test_sets.items())
@@ -782,7 +788,14 @@ def evaluate_external_sets(
         )
         if checkpoint.get("model_name") != model_name:
             raise ValueError(f"Model name mismatch in {checkpoint_path}")
-        model = build_model(model_name, pretrained_encoder=False, image_size=image_size)
+        model = build_model(
+            model_name,
+            pretrained_encoder=False,
+            image_size=image_size,
+            mfps_haar_frequency=mfps_haar_frequency,
+            mfps_global_local=mfps_global_local,
+            mfps_edge_head=mfps_edge_head,
+        )
         model.load_state_dict(checkpoint["model_state"])
         model = model.to(device)
         for dataset_name, cases in external_test_sets.items():
@@ -958,7 +971,13 @@ def train_cross_validation(
     unlabeled_image_paths: list[Path] | None = None,
     unlabeled_image_dir: Path | None = None,
     unlabeled_exclusion_cases: list[Case] | None = None,
+    mfps_haar_frequency: bool = True,
+    mfps_global_local: bool = True,
+    mfps_edge_head: bool = True,
+    mfps_edge_loss_weight: float = 0.1,
 ) -> list[dict[str, float | int | str]]:
+    if not np.isfinite(mfps_edge_loss_weight) or mfps_edge_loss_weight < 0:
+        raise ValueError("mfps_edge_loss_weight must be finite and non-negative")
     if model_name not in MODEL_SPECS:
         raise ValueError(f"Unsupported model: {model_name}")
     if deep_supervision and model_name not in DEEP_SUPERVISION_MODELS:
@@ -1038,6 +1057,10 @@ def train_cross_validation(
         "small_polyp_crop_probability": small_polyp_crop_probability,
         "auxiliary_case_ids": auxiliary_ids,
         "dense_crf": dense_crf,
+        "mfps_haar_frequency": mfps_haar_frequency,
+        "mfps_global_local": mfps_global_local,
+        "mfps_edge_head": mfps_edge_head,
+        "mfps_edge_loss_weight": mfps_edge_loss_weight,
         "case_ids": [case.case_id for case in cases],
         "sessile_case_ids": sorted(sessile_case_ids),
         "max_epochs": epochs,
@@ -1080,6 +1103,11 @@ def train_cross_validation(
     config_path = output_dir / "run_config.json"
     if config_path.is_file():
         existing_config = json.loads(config_path.read_text(encoding="utf-8"))
+        if model_name == "mfps_net":
+            existing_config.setdefault("mfps_haar_frequency", True)
+            existing_config.setdefault("mfps_global_local", True)
+            existing_config.setdefault("mfps_edge_head", True)
+            existing_config.setdefault("mfps_edge_loss_weight", 0.1)
         immutable_keys = set(run_config) - {"max_epochs", "resume_checkpoint"}
         differences = [
             key
@@ -1220,7 +1248,14 @@ def train_cross_validation(
             imagenet_normalize=pretrained_encoder,
         )
 
-        model = build_model(model_name, pretrained_encoder, image_size=image_size)
+        model = build_model(
+            model_name,
+            pretrained_encoder,
+            image_size=image_size,
+            mfps_haar_frequency=mfps_haar_frequency,
+            mfps_global_local=mfps_global_local,
+            mfps_edge_head=mfps_edge_head,
+        )
         parameters_m, gflops_per_image = _model_complexity(model, image_size)
         model = model.to(device)
         ema_model: torch.nn.Module | None = None
@@ -1396,7 +1431,11 @@ def train_cross_validation(
                     with torch.autocast(device_type=device.type, enabled=amp_enabled):
                         outputs = model(images)
                         supervised_loss = segmentation_objective(
-                            loss_name, outputs, masks, deep_supervision
+                            loss_name,
+                            outputs,
+                            masks,
+                            deep_supervision,
+                            edge_weight=mfps_edge_loss_weight,
                         )
                     consistency_loss = supervised_loss.new_zeros(())
                     loss = supervised_loss
@@ -1411,7 +1450,11 @@ def train_cross_validation(
                         student_outputs = model(student_images)
                         student_logits = _final_logits(student_outputs)
                         supervised_loss = segmentation_objective(
-                            loss_name, student_outputs, masks, deep_supervision
+                            loss_name,
+                            student_outputs,
+                            masks,
+                            deep_supervision,
+                            edge_weight=mfps_edge_loss_weight,
                         )
                         consistency_loss = _confidence_consistency_loss(
                             student_logits, teacher_logits

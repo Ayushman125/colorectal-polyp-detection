@@ -790,6 +790,43 @@ evaluation time with `--test-time-augmentation`; keep EMA consistency disabled
 for this first staged comparison unless it is added as a separate ablation.
 The primary matched baseline is pretrained FPN/ResNet-34 BCE+Dice with TTA.
 
+For controlled component ablations, MFPS-Net exposes three independent flags:
+
+| Component | Enable | Disable |
+|---|---|---|
+| Learned Haar fusion | `--mfps-haar-frequency` | `--no-mfps-haar-frequency` |
+| Global-local interaction | `--mfps-global-local` | `--no-mfps-global-local` |
+| Auxiliary edge head | `--mfps-edge-head` | `--no-mfps-edge-head` |
+
+The edge-loss weight is independent of decoder presence:
+`--mfps-edge-loss-weight 0.05|0.10|0.20`. Setting weight zero keeps the edge
+head but removes edge-supervision gradients. The resulting 8-cell
+Haar/global-local/edge factorial is:
+
+| Cell | Haar | Global-local | Edge |
+|---|---|---|---|
+| C0 | off | off | off |
+| C1 | on | off | off |
+| C2 | off | on | off |
+| C3 | off | off | on |
+| C4 | on | on | off |
+| C5 | on | off | on |
+| C6 | off | on | on |
+| C7 | on | on | on |
+
+Example isolated edge-head and edge-loss ablation:
+
+```powershell
+python -m polyp_pipeline train `
+  --dataset-root "kvasir-seg\Kvasir-SEG" `
+  --output-dir "runs\mfps_edge_weight_005" `
+  --model mfps_net --loss bce_dice_edge_boundary `
+  --no-mfps-haar-frequency --no-mfps-global-local --mfps-edge-head `
+  --mfps-edge-loss-weight 0.05 `
+  --folds 5 --seed 42 --size 352 --batch-size 2 --epochs 40 `
+  --patience 8 --pretrained-encoder --device cuda --num-workers 0
+```
+
 ### MFPS-Net v1 five-fold results
 
 The completed run used five outer folds, seed 42, CLAHE, batch size 2, a

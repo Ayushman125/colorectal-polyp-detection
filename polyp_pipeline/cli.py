@@ -56,6 +56,30 @@ def build_parser() -> argparse.ArgumentParser:
     _common_arguments(deep)
     deep.add_argument("--model", choices=tuple(MODEL_SPECS), default="unet_resnet34")
     deep.add_argument(
+        "--mfps-haar-frequency",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable learnable Haar fusion for MFPS-Net.",
+    )
+    deep.add_argument(
+        "--mfps-global-local",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable global-local feature interaction for MFPS-Net.",
+    )
+    deep.add_argument(
+        "--mfps-edge-head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the auxiliary edge decoder for MFPS-Net.",
+    )
+    deep.add_argument(
+        "--mfps-edge-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight for MFPS-Net auxiliary edge BCE and Dice loss.",
+    )
+    deep.add_argument(
         "--loss",
         choices=(
             "bce",
@@ -364,6 +388,9 @@ def main() -> None:
             f"{'_tta' if args.test_time_augmentation else ''}"
             f"{'_semisup' if unlabeled_image_paths is not None else ''}"
             f"{'_ema' if unlabeled_image_paths is None and args.consistency_weight > 0 else ''}"
+            f"{'_nohaar' if not args.mfps_haar_frequency else ''}"
+            f"{'_nogl' if not args.mfps_global_local else ''}"
+            f"{'_noedge' if not args.mfps_edge_head else ''}"
         )
         train_cross_validation(
             cases,
@@ -392,6 +419,10 @@ def main() -> None:
             unlabeled_image_paths=unlabeled_image_paths,
             unlabeled_image_dir=args.unlabeled_image_dir,
             unlabeled_exclusion_cases=unlabeled_exclusion_cases,
+            mfps_haar_frequency=args.mfps_haar_frequency,
+            mfps_global_local=args.mfps_global_local,
+            mfps_edge_head=args.mfps_edge_head,
+            mfps_edge_loss_weight=args.mfps_edge_loss_weight,
         )
     elif args.command == "classical":
         output_dir = args.output_dir / f"classical_{args.preprocessing}"
